@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-multipart
+cryptography
+sat-cfdi
+pydantic
+requests
