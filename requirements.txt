@@ -2,6 +2,6 @@ fastapi
 uvicorn
 python-multipart
 cryptography
-sat-cfdi
+satcfdi
 pydantic
 requests
