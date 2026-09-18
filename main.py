@@ -1,12 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import base64
 import zipfile
 import io
 
-# Importaciones corregidas para la versión actual de satcfdi
-from satcfdi.signer import Signer
+# Importaciones universales y estables de satcfdi
+import satcfdi
+from satcfdi import Signer
 from satcfdi.ws.consulta_masiva import ConsultaMasiva, TipoDescargaMasivaTerceros
 
 app = FastAPI(
@@ -15,7 +15,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Permitir conexiones desde cualquier origen (Lovable)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,22 +24,25 @@ app.add_middleware(
 )
 
 def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str):
-    """Carga y valida los certificados de la e.firma."""
+    """Carga y valida los certificados de la e.firma en memoria."""
     try:
-        return Signer.load(
-            certificate=cer_bytes,
-            key=key_bytes,
-            password=password.encode("utf-8")
-        )
+        # En satcfdi 2026+ Signer acepta directamente los bytes o el método load
+        if hasattr(Signer, "load"):
+            return Signer.load(certificate=cer_bytes, key=key_bytes, password=password.encode("utf-8"))
+        return Signer(cer=cer_bytes, key=key_bytes, password=password.encode("utf-8"))
     except Exception as e:
         raise HTTPException(
             status_code=400, 
-            detail=f"Error al autenticar con la e.firma: Verifique certificados y contraseña ({str(e)})"
+            detail=f"Error con los archivos de la e.firma o contraseña: {str(e)}"
         )
 
 @app.get("/")
 def ruta_raiz():
-    return {"status": "ok", "mensaje": "El servidor del SAT está activo y funcionando"}
+    return {
+        "status": "ok", 
+        "servicio": "SAT Descarga Masiva API", 
+        "version_libreria": getattr(satcfdi, "__version__", "activa")
+    }
 
 @app.post("/api/sat/solicitar")
 async def solicitar_descarga(
