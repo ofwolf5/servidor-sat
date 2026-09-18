@@ -19,7 +19,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio de Descarga Masiva SAT",
     description="Backend oficial SOAP SAT para Lovable",
-    version="3.1.0"
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -38,6 +38,17 @@ class FielNativa:
     def __init__(self, cer_bytes: bytes, key_bytes: bytes, password: str):
         self.cert = x509.load_der_x509_certificate(cer_bytes)
         self.cert_b64 = base64.b64encode(cer_bytes).decode("utf-8")
+        
+        # Extraer RFC del certificado
+        self.rfc = ""
+        for attr in self.cert.subject:
+            # OID común para RFC o serialNumber en certificados del SAT
+            if attr.oid._name in ("serialNumber", "x500UniqueIdentifier"):
+                val = attr.value.strip()
+                if " " in val:
+                    val = val.split(" ")[0]
+                self.rfc = val
+        
         try:
             self.key = load_der_private_key(key_bytes, password=password.encode("utf-8"))
         except Exception:
@@ -54,14 +65,25 @@ def formatear_fecha(fecha_str: str, es_fin: bool = False) -> str:
         return f"{fecha_limpia}T{hora}"
     return fecha_limpia
 
+# ---------------------------------------------------------------------------
+# SOAP del SAT: Autenticación
+# ---------------------------------------------------------------------------
+
 def obtener_token_sat(fiel: FielNativa) -> str:
-    """Solicita token de autenticación SOAP al SAT."""
+    """Solicita token oficial de autenticación al SAT."""
     ahora = datetime.now(timezone.utc)
     creado = ahora.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     expira = (ahora + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     timestamp = f'<u:Timestamp xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" u:Id="_0"><u:Created>{creado}</u:Created><u:Expires>{expira}</u:Expires></u:Timestamp>'
-    firma_b64 = fiel.firmar_sha1(timestamp.encode("utf-8"))
+    
+    digest_hash = hashes.Hash(hashes.SHA1())
+    digest_hash.update(timestamp.encode("utf-8"))
+    digest_val = base64.b64encode(digest_hash.finalize()).decode("utf-8")
+
+    signed_info = f'<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/><Reference URI="#_0"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><DigestValue>{digest_val}</DigestValue></Reference></SignedInfo>'
+    
+    firma_b64 = fiel.firmar_sha1(signed_info.encode("utf-8"))
 
     soap_envelope = f"""<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
     <s:Header>
@@ -69,17 +91,7 @@ def obtener_token_sat(fiel: FielNativa) -> str:
             {timestamp}
             <o:BinarySecurityToken u:Id="uuid-{uuid.uuid4()}-1" ValueType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3" EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{fiel.cert_b64}</o:BinarySecurityToken>
             <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
-                <SignedInfo>
-                    <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                    <SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/>
-                    <Reference URI="#_0">
-                        <Transforms>
-                            <Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                        </Transforms>
-                        <DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-                        <DigestValue>{base64.b64encode(hashes.Hash(hashes.SHA1()).update(timestamp.encode('utf-8')) or b'').decode('utf-8')}</DigestValue>
-                    </Reference>
-                </SignedInfo>
+                {signed_info}
                 <SignatureValue>{firma_b64}</SignatureValue>
                 <KeyInfo>
                     <o:SecurityTokenReference>
@@ -99,82 +111,71 @@ def obtener_token_sat(fiel: FielNativa) -> str:
         "SOAPAction": "http://DescargaMasivaTerceros.sat.gob.mx/IAutenticacion/Autentica"
     }
     url = "https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/Autenticacion/Autenticacion.svc"
-    res = requests.post(url, data=soap_envelope, headers=headers, timeout=20)
+    res = requests.post(url, data=soap_envelope.encode("utf-8"), headers=headers, timeout=20)
     
     root = ET.fromstring(res.text)
     token_elem = root.find(".//{http://DescargaMasivaTerceros.sat.gob.mx}token")
     if token_elem is not None and token_elem.text:
         return token_elem.text
-    return ""
+    raise HTTPException(status_code=401, detail=f"El SAT rechazó la autenticación: {res.text[:200]}")
 
-def procesar_paquete_zip(paquete_raw) -> list:
-    """
-    Decodifica Base64 y realiza extracción en 2 niveles (ZIP principal y ZIPs anidados).
-    """
-    if not paquete_raw:
-        logger.error("El contenido del paquete viene vacío.")
+# ---------------------------------------------------------------------------
+# SOAP del SAT: Descompresión de Paquetes
+# ---------------------------------------------------------------------------
+
+def extraer_xmls_reales(paquete_b64_raw: str) -> list:
+    """Decodifica Base64 y extrae XMLs tanto directos como anidados en .zip."""
+    if not paquete_b64_raw:
         return []
 
-    # 1. Limpieza y decodificación de Base64
-    paquete_bytes = b""
-    if isinstance(paquete_raw, str):
-        # Quitar espacios o saltos de línea que el XML del SAT suele agregar
-        paquete_limpio = paquete_raw.strip().replace("\n", "").replace("\r", "").replace(" ", "")
-        try:
-            paquete_bytes = base64.b64decode(paquete_limpio)
-        except Exception as e:
-            logger.error(f"Fallo al decodificar Base64 directo: {e}")
-            paquete_bytes = paquete_raw.encode("utf-8")
-    elif isinstance(paquete_raw, bytes):
-        try:
-            paquete_bytes = base64.b64decode(paquete_raw)
-        except Exception:
-            paquete_bytes = paquete_raw
+    # Limpieza estricta de Base64
+    limpio = paquete_b64_raw.strip().replace("\n", "").replace("\r", "").replace(" ", "")
+    try:
+        paquete_bytes = base64.b64decode(limpio)
+    except Exception as e:
+        logger.error(f"Error decodificando Base64: {e}")
+        return []
 
-    logger.info(f"Tamaño de los bytes descomprimibles: {len(paquete_bytes)} bytes")
+    logger.info(f"Bytes del ZIP recibido del SAT: {len(paquete_bytes)}")
 
     xmls = []
     try:
         with zipfile.ZipFile(io.BytesIO(paquete_bytes)) as z_padre:
             nombres = z_padre.namelist()
-            logger.info(f"Nombres en el ZIP principal ({len(nombres)} archivos): {nombres[:10]}")
+            logger.info(f"Nombres en el ZIP del SAT ({len(nombres)} archivos): {nombres[:10]}")
 
-            for n in nombres:
-                contenido = z_padre.read(n)
-                # Nivel 2: Comprobación de ZIPs anidados (ej. UUID.xml.zip)
-                if n.lower().endswith(".zip"):
-                    logger.info(f"Extrayendo archivo ZIP anidado: {n}")
+            for nombre in nombres:
+                contenido = z_padre.read(nombre)
+                # Caso de ZIP anidado (común cuando son muchas facturas)
+                if nombre.lower().endswith(".zip"):
                     try:
                         with zipfile.ZipFile(io.BytesIO(contenido)) as z_hijo:
                             for n2 in z_hijo.namelist():
                                 if n2.lower().endswith(".xml"):
-                                    c_xml = z_hijo.read(n2).decode("utf-8", errors="ignore")
-                                    xmls.append({"archivo": n2, "xml_contenido": c_xml})
-                    except Exception as e_hijo:
-                        logger.error(f"Error extrayendo sub-zip {n}: {e_hijo}")
-                elif n.lower().endswith(".xml"):
-                    c_xml = contenido.decode("utf-8", errors="ignore")
-                    xmls.append({"archivo": n, "xml_contenido": c_xml})
-
-    except zipfile.BadZipFile:
-        logger.error("Los bytes no corresponden a un formato ZIP válido.")
+                                    xml_texto = z_hijo.read(n2).decode("utf-8", errors="ignore")
+                                    xmls.append({"archivo": n2, "xml_contenido": xml_texto})
+                    except Exception as e_anidado:
+                        logger.warning(f"Error en sub-ZIP {nombre}: {e_anidado}")
+                elif nombre.lower().endswith(".xml"):
+                    xml_texto = contenido.decode("utf-8", errors="ignore")
+                    xmls.append({"archivo": nombre, "xml_contenido": xml_texto})
     except Exception as e:
-        logger.error(f"Error procesando estructura ZIP: {e}")
+        logger.error(f"Error abriendo ZIP del SAT: {e}")
 
-    logger.info(f"Total de comprobantes XML extraídos con éxito: {len(xmls)}")
+    logger.info(f"Total de XMLs reales extraídos: {len(xmls)}")
     return xmls
 
 # ---------------------------------------------------------------------------
-# Endpoints de la API
+# Endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/")
 def ruta_raiz():
     return {
         "status": "ok", 
-        "servicio": "SAT Descarga Masiva API",
-        "extractor": "Base64 + Dual-ZIP",
-        "version": "3.1.0"
+        "servicio": "SAT Descarga Masiva API Oficial",
+        "modo": "SOAP Puro",
+        "version": "4.0.0"
     }
 
 @app.post("/api/sat/solicitar")
@@ -185,23 +186,88 @@ async def solicitar_descarga(
     rfc: str = Form(...),
     fecha_inicio: str = Form(...),
     fecha_fin: str = Form(...),
-    tipo: str = Form(...)
+    tipo: str = Form(...)  # "emitidos" o "recibidos"
 ):
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
-    FielNativa(cer_bytes, key_bytes, password)
+
+    try:
+        fiel = FielNativa(cer_bytes, key_bytes, password)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error en certificados e.firma: {str(e)}")
+
+    token = obtener_token_sat(fiel)
 
     f_inicio = formatear_fecha(fecha_inicio, es_fin=False)
     f_fin = formatear_fecha(fecha_fin, es_fin=True)
-    rfc_limpio = rfc.strip().upper()
+    rfc_solicitante = rfc.strip().upper()
     es_emitidos = tipo.lower() == "emitidos"
-    id_solicitud = f"{rfc_limpio}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
+    # Construcción de la solicitud al Web Service del SAT
+    attr_emisor = f'RfcEmisor="{rfc_solicitante}"' if es_emitidos else ''
+    attr_receptor = f'RfcReceptor="{rfc_solicitante}"' if not es_emitidos else ''
+
+    cuerpo_solicitud = f'<solicitud FechaInicial="{f_inicio}" FechaFinal="{f_fin}" {attr_emisor} {attr_receptor} RfcSolicitante="{rfc_solicitante}" TipoSolicitud="CFDI"/>'
+    
+    # Firma del nodo solicitud
+    digest_hash = hashes.Hash(hashes.SHA1())
+    digest_hash.update(cuerpo_solicitud.encode("utf-8"))
+    digest_val = base64.b64encode(digest_hash.finalize()).decode("utf-8")
+
+    signed_info = f'<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/><Reference URI=""><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xml-exc-c14n#"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><DigestValue>{digest_val}</DigestValue></Reference></SignedInfo>'
+    firma_b64 = fiel.firmar_sha1(signed_info.encode("utf-8"))
+
+    soap_req = f"""<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+    <s:Header/>
+    <s:Body>
+        <SolicitaDescarga xmlns="http://DescargaMasivaTerceros.sat.gob.mx">
+            <solicitud FechaInicial="{f_inicio}" FechaFinal="{f_fin}" {attr_emisor} {attr_receptor} RfcSolicitante="{rfc_solicitante}" TipoSolicitud="CFDI">
+                <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+                    {signed_info}
+                    <SignatureValue>{firma_b64}</SignatureValue>
+                    <KeyInfo>
+                        <X509Data>
+                            <X509IssuerSerial>
+                                <X509IssuerName>{fiel.cert.issuer.rfc4514_string()}</X509IssuerName>
+                                <X509SerialNumber>{fiel.cert.serial_number}</X509SerialNumber>
+                            </X509IssuerSerial>
+                            <X509Certificate>{fiel.cert_b64}</X509Certificate>
+                        </X509Data>
+                    </KeyInfo>
+                </Signature>
+            </solicitud>
+        </SolicitaDescarga>
+    </s:Body>
+</s:Envelope>"""
+
+    headers = {
+        "Content-Type": "text/xml;charset=utf-8",
+        "SOAPAction": "http://DescargaMasivaTerceros.sat.gob.mx/ISolicitaDescargaService/SolicitaDescarga",
+        "Authorization": f'WRAP access_token="{token}"'
+    }
+
+    url = "https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/SolicitaDescargaService.svc"
+    resp = requests.post(url, data=soap_req.encode("utf-8"), headers=headers, timeout=30)
+    
+    root = ET.fromstring(resp.text)
+    res_elem = root.find(".//{http://DescargaMasivaTerceros.sat.gob.mx}SolicitaDescargaResult")
+    
+    if res_elem is None:
+        raise HTTPException(status_code=502, detail=f"Respuesta inesperada del SAT: {resp.text[:300]}")
+
+    cod_estatus = res_elem.get("CodEstatus", "5000")
+    mensaje = res_elem.get("Mensaje", "")
+    id_solicitud = res_elem.get("IdSolicitud", "")
+
+    if cod_estatus != "5000":
+        raise HTTPException(status_code=400, detail=f"SAT Código {cod_estatus}: {mensaje}")
+
+    logger.info(f"Solicitud aceptada por el SAT con ID real: {id_solicitud}")
     return {
         "status": "success",
         "id_solicitud": id_solicitud,
-        "codigo_estatus": "5000",
-        "mensaje": f"Solicitud registrada para {rfc_limpio} ({'Emitidos' if es_emitidos else 'Recibidos'})"
+        "codigo_estatus": cod_estatus,
+        "mensaje": mensaje
     }
 
 @app.post("/api/sat/verificar")
@@ -213,15 +279,74 @@ async def verificar_solicitud(
 ):
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
-    FielNativa(cer_bytes, key_bytes, password)
+    fiel = FielNativa(cer_bytes, key_bytes, password)
+    token = obtener_token_sat(fiel)
+
+    cuerpo_verif = f'<solicitud IdSolicitud="{id_solicitud}" RfcSolicitante="{fiel.rfc}"/>'
+    
+    digest_hash = hashes.Hash(hashes.SHA1())
+    digest_hash.update(cuerpo_verif.encode("utf-8"))
+    digest_val = base64.b64encode(digest_hash.finalize()).decode("utf-8")
+
+    signed_info = f'<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/><Reference URI=""><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><DigestValue>{digest_val}</DigestValue></Reference></SignedInfo>'
+    firma_b64 = fiel.firmar_sha1(signed_info.encode("utf-8"))
+
+    soap_req = f"""<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+    <s:Header/>
+    <s:Body>
+        <VerificaSolicitudDescarga xmlns="http://DescargaMasivaTerceros.sat.gob.mx">
+            <solicitud IdSolicitud="{id_solicitud}" RfcSolicitante="{fiel.rfc}">
+                <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+                    {signed_info}
+                    <SignatureValue>{firma_b64}</SignatureValue>
+                    <KeyInfo>
+                        <X509Data>
+                            <X509IssuerSerial>
+                                <X509IssuerName>{fiel.cert.issuer.rfc4514_string()}</X509IssuerName>
+                                <X509SerialNumber>{fiel.cert.serial_number}</X509SerialNumber>
+                            </X509IssuerSerial>
+                            <X509Certificate>{fiel.cert_b64}</X509Certificate>
+                        </X509Data>
+                    </KeyInfo>
+                </Signature>
+            </solicitud>
+        </VerificaSolicitudDescarga>
+    </s:Body>
+</s:Envelope>"""
+
+    headers = {
+        "Content-Type": "text/xml;charset=utf-8",
+        "SOAPAction": "http://DescargaMasivaTerceros.sat.gob.mx/IVerificaSolicitudDescargaService/VerificaSolicitudDescarga",
+        "Authorization": f'WRAP access_token="{token}"'
+    }
+
+    url = "https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/VerificaSolicitudDescargaService.svc"
+    resp = requests.post(url, data=soap_req.encode("utf-8"), headers=headers, timeout=30)
+
+    root = ET.fromstring(resp.text)
+    res_elem = root.find(".//{http://DescargaMasivaTerceros.sat.gob.mx}VerificaSolicitudDescargaResult")
+
+    if res_elem is None:
+        raise HTTPException(status_code=502, detail=f"Error en respuesta de verificación: {resp.text[:300]}")
+
+    estado = res_elem.get("EstadoSolicitud", "2")  # 1: Aceptada, 2: En Proceso, 3: Terminada, 4: Error, 5: Rechazada
+    numero_cfdis = int(res_elem.get("NumeroCFDIs", "0"))
+    
+    # Extraer los paquetes entregados por el SAT
+    paquetes = []
+    for pkg in res_elem.findall(".//{http://DescargaMasivaTerceros.sat.gob.mx}IdsPaquetes"):
+        if pkg.text:
+            paquetes.append(pkg.text.strip())
+
+    logger.info(f"Verificación IdSolicitud {id_solicitud}: Estado={estado}, CFDIs={numero_cfdis}, Paquetes={paquetes}")
 
     return {
         "id_solicitud": id_solicitud,
-        "estado_solicitud": "3",
-        "codigo_estado_solicitud": "5000",
-        "numero_cfdis": 1,
-        "paquetes_listos": True,
-        "ids_paquetes": [f"PKG_{id_solicitud}"]
+        "estado_solicitud": estado,
+        "codigo_estado_solicitud": res_elem.get("CodigoEstadoSolicitud", ""),
+        "numero_cfdis": numero_cfdis,
+        "paquetes_listos": estado == "3" and len(paquetes) > 0,
+        "ids_paquetes": paquetes
     }
 
 @app.post("/api/sat/descargar-paquete")
@@ -229,69 +354,79 @@ async def descargar_paquete(
     cer_file: UploadFile = File(...),
     key_file: UploadFile = File(...),
     password: str = Form(...),
-    id_paquete: str = Form(...),
-    paquete_b64: str = Form(None)  # En caso de que Lovable ya tenga el paquete en memoria
+    id_paquete: str = Form(...)
 ):
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
     fiel = FielNativa(cer_bytes, key_bytes, password)
+    token = obtener_token_sat(fiel)
 
-    logger.info(f"Procesando descarga para ID de Paquete: {id_paquete}")
+    logger.info(f"Descargando paquete real del SAT: {id_paquete}")
 
-    paquete_contenido = None
+    cuerpo_descarga = f'<peticionDescarga IdPaquete="{id_paquete}" RfcSolicitante="{fiel.rfc}"/>'
+    
+    digest_hash = hashes.Hash(hashes.SHA1())
+    digest_hash.update(cuerpo_descarga.encode("utf-8"))
+    digest_val = base64.b64encode(digest_hash.finalize()).decode("utf-8")
 
-    # Si Lovable envió el payload directamente
-    if paquete_b64:
-        paquete_contenido = paquete_b64
-    else:
-        # Petición SOAP oficial de descarga directa al SAT
-        try:
-            token = obtener_token_sat(fiel)
-            url_descarga = "https://cfdidescargamasiva.clouda.sat.gob.mx/DescargaMasivaService.svc"
-            
-            # Petición firmada para descargar paquete
-            peticion_xml = f'<DescargaMasiva xmlns="http://DescargaMasivaTerceros.sat.gob.mx" IdPaquete="{id_paquete}" RfcSolicitante="{fiel.cert_b64}"/>'
-            
-            soap_req = f"""<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
-                <s:Header/>
-                <s:Body>
-                    <PeticionDescargaMasiva xmlns="http://DescargaMasivaTerceros.sat.gob.mx">
-                        <peticionDescarga IdPaquete="{id_paquete}"/>
-                    </PeticionDescargaMasiva>
-                </s:Body>
-            </s:Envelope>"""
+    signed_info = f'<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/><Reference URI=""><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><DigestValue>{digest_val}</DigestValue></Reference></SignedInfo>'
+    firma_b64 = fiel.firmar_sha1(signed_info.encode("utf-8"))
 
-            headers = {
-                "Content-Type": "text/xml;charset=utf-8",
-                "SOAPAction": "http://DescargaMasivaTerceros.sat.gob.mx/IDescargaMasiva/Descargar",
-                "Authorization": f"WRAP access_token=\"{token}\""
-            }
+    soap_req = f"""<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+    <s:Header/>
+    <s:Body>
+        <PeticionDescargaMasiva xmlns="http://DescargaMasivaTerceros.sat.gob.mx">
+            <peticionDescarga IdPaquete="{id_paquete}" RfcSolicitante="{fiel.rfc}">
+                <Signature xmlns="http://www.w3.org/2000/09/xmldsig#">
+                    {signed_info}
+                    <SignatureValue>{firma_b64}</SignatureValue>
+                    <KeyInfo>
+                        <X509Data>
+                            <X509IssuerSerial>
+                                <X509IssuerName>{fiel.cert.issuer.rfc4514_string()}</X509IssuerName>
+                                <X509SerialNumber>{fiel.cert.serial_number}</X509SerialNumber>
+                            </X509IssuerSerial>
+                            <X509Certificate>{fiel.cert_b64}</X509Certificate>
+                        </X509Data>
+                    </KeyInfo>
+                </Signature>
+            </peticionDescarga>
+        </PeticionDescargaMasiva>
+    </s:Body>
+</s:Envelope>"""
 
-            resp = requests.post(url_descarga, data=soap_req, headers=headers, timeout=60)
-            if "<Paquete>" in resp.text:
-                inicio = resp.text.find("<Paquete>") + len("<Paquete>")
-                fin = resp.text.find("</Paquete>")
-                paquete_contenido = resp.text[inicio:fin]
-                logger.info(f"Nodo <Paquete> extraído del XML del SAT con {len(paquete_contenido)} caracteres Base64.")
-        except Exception as e_soap:
-            logger.warning(f"Consulta SOAP de descarga no completada: {e_soap}")
+    headers = {
+        "Content-Type": "text/xml;charset=utf-8",
+        "SOAPAction": "http://DescargaMasivaTerceros.sat.gob.mx/IDescargaMasivaTercerosService/Descargar",
+        "Authorization": f'WRAP access_token="{token}"'
+    }
 
-    # Si no se pudo obtener contenido del SAT, emitir comprobante de confirmación para no dejar la tabla vacía
-    if not paquete_contenido:
-        logger.warning(f"No se recibieron bytes crudos para el paquete {id_paquete}. Retornando acuse.")
-        xmls = [{
-            "archivo": f"{id_paquete}.xml",
-            "xml_contenido": f"""<?xml version="1.0" encoding="utf-8"?>
-<cfdi:Comprobante xmlns:cfdi="http://www.sat.gob.mx/cfd/4" Version="4.0" Fecha="{datetime.now().isoformat()}" Folio="{id_paquete[:8]}" SubTotal="0.00" Total="0.00" TipoDeComprobante="I">
-    <cfdi:Emisor Rfc="XAXX010101000" Nombre="PUBLICO EN GENERAL" RegimenFiscal="601"/>
-    <cfdi:Receptor Rfc="XAXX010101000" Nombre="PUBLICO EN GENERAL" UsoCFDI="G03" DomicilioFiscalReceptor="06300" RegimenFiscalReceptor="601"/>
-    <cfdi:Conceptos>
-        <cfdi:Concepto ClaveProdServ="01010101" Cantidad="1" ClaveUnidad="ACT" Descripcion="Paquete SAT {id_paquete} verificado" ValorUnitario="0.00" Importe="0.00"/>
-    </cfdi:Conceptos>
-</cfdi:Comprobante>"""
-        }]
-    else:
-        xmls = procesar_paquete_zip(paquete_contenido)
+    url = "https://cfdidescargamasiva.clouda.sat.gob.mx/DescargaMasivaService.svc"
+    resp = requests.post(url, data=soap_req.encode("utf-8"), headers=headers, timeout=60)
+
+    root = ET.fromstring(resp.text)
+    res_elem = root.find(".//{http://DescargaMasivaTerceros.sat.gob.mx}RespuestaDescargaMasivaTercerosSalida")
+    
+    if res_elem is None:
+        raise HTTPException(status_code=502, detail=f"Respuesta inesperada al descargar paquete: {resp.text[:300]}")
+
+    paquete_elem = res_elem.find(".//{http://DescargaMasivaTerceros.sat.gob.mx}Paquete")
+    if paquete_elem is None or not paquete_elem.text:
+        cod_estatus = res_elem.get("CodEstatus", "Desconocido")
+        mensaje = res_elem.get("Mensaje", "Sin mensaje")
+        raise HTTPException(
+            status_code=404, 
+            detail=f"El SAT no devolvió contenido para el paquete {id_paquete}. Estatus SAT: {cod_estatus} - {mensaje}"
+        )
+
+    # Extraer los XMLs auténticos
+    xmls = extraer_xmls_reales(paquete_elem.text)
+
+    if not xmls:
+        raise HTTPException(
+            status_code=500,
+            detail=f"El paquete {id_paquete} fue entregado por el SAT pero no contenía archivos XML legibles."
+        )
 
     return {
         "id_paquete": id_paquete,
