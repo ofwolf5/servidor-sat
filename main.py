@@ -8,14 +8,13 @@ import logging
 
 from satcfdi.models import Signer
 
-# Configuración de logs visibles en el panel de Render
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sat_service")
 
 app = FastAPI(
     title="Microservicio de Descarga Masiva SAT",
     description="Backend puente para Lovable",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 app.add_middleware(
@@ -35,7 +34,7 @@ def formatear_fecha_sat(fecha_str: str, es_fin: bool = False) -> str:
     return fecha_limpia
 
 def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Signer:
-    """Carga y valida los certificados de la e.firma."""
+    """Carga y valida los certificados de la e.firma con Signer.load."""
     try:
         return Signer.load(
             certificate=cer_bytes,
@@ -43,16 +42,34 @@ def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Signer:
             password=password.encode("utf-8")
         )
     except Exception as e:
+        logger.error(f"Error cargando certificados: {e}")
         raise HTTPException(
             status_code=400, 
             detail=f"Error validando e.firma o contraseña: {str(e)}"
         )
 
+def obtener_portal_sat(fiel: Signer):
+    """
+    Inicializa el cliente de conexión con el SAT pasando la firma de forma POSICIONAL.
+    Evita el error 'PortalManager got an unexpected keyword argument fiel'.
+    """
+    try:
+        from satcfdi.portal import PortalManager
+        return PortalManager(fiel)
+    except (ImportError, TypeError):
+        pass
+
+    try:
+        from satcfdi.portal import SATPortal
+        return SATPortal(fiel)
+    except (ImportError, TypeError):
+        pass
+
+    from satcfdi.portal.portal import PortalManager
+    return PortalManager(fiel)
+
 def extraer_xmls_recursivo(paquete_data) -> list:
-    """
-    Descomprime paquetes del SAT manejando Base64 y ZIPs anidados (.zip dentro de .zip).
-    """
-    # Si viene como string base64 o bytes base64, decodificar
+    """Extrae XMLs manejando Base64 y ZIPs anidados (.zip dentro de .zip)."""
     if isinstance(paquete_data, str):
         try:
             paquete_bytes = base64.b64decode(paquete_data)
@@ -60,7 +77,6 @@ def extraer_xmls_recursivo(paquete_data) -> list:
             paquete_bytes = paquete_data.encode("utf-8")
     elif isinstance(paquete_data, bytes):
         try:
-            # Si los primeros bytes son texto ASCII base64
             paquete_bytes = base64.b64decode(paquete_data)
         except Exception:
             paquete_bytes = paquete_data
@@ -68,18 +84,15 @@ def extraer_xmls_recursivo(paquete_data) -> list:
         return []
 
     xml_encontrados = []
-
     try:
         with zipfile.ZipFile(io.BytesIO(paquete_bytes)) as z_padre:
-            nombres_padre = z_padre.namelist()
-            logger.info(f"Archivos en el ZIP principal: {len(nombres_padre)} ({nombres_padre[:5]}...)")
-
-            for nombre in nombres_padre:
+            nombres = z_padre.namelist()
+            logger.info(f"Archivos encontrados en el paquete principal: {len(nombres)}")
+            
+            for nombre in nombres:
                 contenido = z_padre.read(nombre)
-                
-                # Caso 1: Archivo ZIP anidado (común en paquetes masivos del SAT)
+                # Caso de ZIP anidado
                 if nombre.lower().endswith(".zip"):
-                    logger.info(f"Desempaquetando ZIP anidado: {nombre}")
                     try:
                         with zipfile.ZipFile(io.BytesIO(contenido)) as z_hijo:
                             for n2 in z_hijo.namelist():
@@ -89,21 +102,17 @@ def extraer_xmls_recursivo(paquete_data) -> list:
                                         "archivo": n2,
                                         "xml_contenido": c_xml
                                     })
-                    except Exception as e_hijo:
-                        logger.error(f"Error al leer zip interno {nombre}: {e_hijo}")
-
-                # Caso 2: XML directo
+                    except Exception as e_zip:
+                        logger.warning(f"No se pudo descomprimir sub-archivo {nombre}: {e_zip}")
+                # Caso de XML directo
                 elif nombre.lower().endswith(".xml"):
                     c_xml = contenido.decode("utf-8", errors="ignore")
                     xml_encontrados.append({
                         "archivo": nombre,
                         "xml_contenido": c_xml
                     })
-
-    except zipfile.BadZipFile:
-        logger.error("El contenido descargado no es un archivo ZIP válido.")
     except Exception as e:
-        logger.error(f"Error procesando el paquete comprimido: {str(e)}")
+        logger.error(f"Error procesando ZIP: {str(e)}")
 
     return xml_encontrados
 
@@ -112,8 +121,7 @@ def ruta_raiz():
     return {
         "status": "ok", 
         "servicio": "SAT Descarga Masiva API",
-        "modulo_firma": True,
-        "modulo_ws": True
+        "version": "1.2.0"
     }
 
 @app.post("/api/sat/solicitar")
@@ -135,12 +143,11 @@ async def solicitar_descarga(
     rfc_limpio = rfc.strip().upper()
     es_emitidos = tipo.lower() == "emitidos"
 
-    logger.info(f"Iniciando solicitud para RFC: {rfc_limpio}, Tipo: {tipo}, Rango: {f_inicio} a {f_fin}")
+    logger.info(f"Solicitando descarga al SAT para RFC: {rfc_limpio}, tipo: {tipo}")
+
+    portal = obtener_portal_sat(fiel)
 
     try:
-        from satcfdi.portal import SATPortal
-        portal = SATPortal(fiel=fiel)
-        
         kwargs = {
             "fecha_inicial": f_inicio,
             "fecha_final": f_fin,
@@ -152,9 +159,11 @@ async def solicitar_descarga(
         else:
             kwargs["rfc_receptor"] = rfc_limpio
 
-        res = portal.descarga_masiva.solicita(**kwargs)
+        # Llamada directa al Web Service oficial del SAT
+        cliente_dm = getattr(portal, "descarga_masiva", portal)
+        res = cliente_dm.solicita(**kwargs)
+        
         cod_estatus = str(res.get("CodEstatus", "5000"))
-
         if cod_estatus != "5000":
             raise HTTPException(
                 status_code=400,
@@ -170,14 +179,8 @@ async def solicitar_descarga(
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning(f"Fallback activado en solicitud: {str(e)}")
-        id_gen = f"SAT-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        return {
-            "status": "success",
-            "id_solicitud": id_gen,
-            "codigo_estatus": "5000",
-            "mensaje": f"Solicitud registrada para {rfc_limpio}"
-        }
+        logger.error(f"Error en solicitud con el SAT: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Error comunicando con el SAT: {str(e)}")
 
 @app.post("/api/sat/verificar")
 async def verificar_solicitud(
@@ -190,30 +193,26 @@ async def verificar_solicitud(
     key_bytes = await key_file.read()
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
 
+    portal = obtener_portal_sat(fiel)
+
     try:
-        from satcfdi.portal import SATPortal
-        portal = SATPortal(fiel=fiel)
-        res = portal.descarga_masiva.verifica(id_solicitud=id_solicitud)
+        cliente_dm = getattr(portal, "descarga_masiva", portal)
+        res = cliente_dm.verifica(id_solicitud=id_solicitud)
         
         paquetes = res.get("IdsPaquetes", [])
+        estado_solicitud = str(res.get("EstadoSolicitud", "2")) # 1: Aceptada, 2: En Proceso, 3: Terminada
+        
         return {
             "id_solicitud": id_solicitud,
-            "estado_solicitud": str(res.get("EstadoSolicitud", "3")),
+            "estado_solicitud": estado_solicitud,
             "codigo_estado_solicitud": str(res.get("CodigoEstadoSolicitud", "5000")),
             "numero_cfdis": res.get("NumeroCFDIs", len(paquetes)),
-            "paquetes_listos": len(paquetes) > 0,
+            "paquetes_listos": len(paquetes) > 0 and estado_solicitud == "3",
             "ids_paquetes": paquetes
         }
     except Exception as e:
-        logger.warning(f"Fallback en verificación: {str(e)}")
-        return {
-            "id_solicitud": id_solicitud,
-            "estado_solicitud": "3",
-            "codigo_estado_solicitud": "5000",
-            "numero_cfdis": 1,
-            "paquetes_listos": True,
-            "ids_paquetes": [f"PK_{id_solicitud}"]
-        }
+        logger.error(f"Error verificando con el SAT: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Error consultando estatus al SAT: {str(e)}")
 
 @app.post("/api/sat/descargar-paquete")
 async def descargar_paquete(
@@ -226,20 +225,18 @@ async def descargar_paquete(
     key_bytes = await key_file.read()
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
 
-    logger.info(f"Solicitando descarga de paquete: {id_paquete}")
+    portal = obtener_portal_sat(fiel)
 
     try:
-        from satcfdi.portal import SATPortal
-        portal = SATPortal(fiel=fiel)
-        res = portal.descarga_masiva.descarga(id_paquete=id_paquete)
+        cliente_dm = getattr(portal, "descarga_masiva", portal)
+        res = cliente_dm.descarga(id_paquete=id_paquete)
         
         paquete_raw = res.get("Paquete") or res.get("PaqueteB64")
         if not paquete_raw:
-            logger.error("El SAT no retornó bytes en el campo de paquete")
             raise HTTPException(status_code=404, detail="El SAT no devolvió contenido para este paquete.")
 
         xmls = extraer_xmls_recursivo(paquete_raw)
-        logger.info(f"Paquete {id_paquete}: Se extrajeron exitosamente {len(xmls)} XMLs")
+        logger.info(f"Paquete {id_paquete}: {len(xmls)} XMLs extraídos con éxito.")
 
         return {
             "id_paquete": id_paquete,
@@ -249,5 +246,5 @@ async def descargar_paquete(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error procesando descarga real del SAT: {str(e)}")
-        raise HTTPException(status_code=502, detail=f"Error en descarga masiva: {str(e)}")
+        logger.error(f"Error en descarga: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Falla al descargar paquete del SAT: {str(e)}")
