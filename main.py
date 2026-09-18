@@ -3,12 +3,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 from typing import Optional
 from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 import base64
 import zipfile
 import io
 import logging
 
-# Clases oficiales de cfdiclient
 from cfdiclient import (
     Fiel,
     Autenticacion,
@@ -24,7 +24,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio de Descarga Masiva SAT",
     description="Backend oficial cfdiclient para Lovable",
-    version="5.1.0"
+    version="5.2.0"
 )
 
 app.add_middleware(
@@ -45,26 +45,51 @@ def parse_fecha(fecha_str: str, es_fin: bool = False) -> datetime:
         return dt.replace(hour=23, minute=59, second=59)
     return dt.replace(hour=0, minute=0, second=0)
 
-def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
-    """Inicializa la FIEL con cfdiclient."""
+def normalizar_llave_privada(key_bytes: bytes, password: str) -> bytes:
+    """
+    Carga la llave .key del SAT (DER PKCS#8 cifrada o PEM)
+    y asegura que cfdiclient pueda procesarla sin errores de formato.
+    """
+    pwd_bytes = password.encode("utf-8") if isinstance(password, str) else password
+    
+    # 1. Intentar cargar como DER PKCS#8 (formato estándar nativo del SAT)
     try:
+        priv_key = serialization.load_der_private_key(key_bytes, password=pwd_bytes)
+    except Exception:
+        try:
+            # 2. Intentar cargar como PEM
+            priv_key = serialization.load_pem_private_key(key_bytes, password=pwd_bytes)
+        except Exception as e_pem:
+            logger.error(f"Falla al descifrar la llave privada con la contraseña: {e_pem}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"No se pudo descifrar el archivo .key. Verifique su contraseña: {str(e_pem)}"
+            )
+
+    # Convertir a DER PKCS#8 estándar limpio para cfdiclient
+    return priv_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(pwd_bytes)
+    )
+
+def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
+    """Inicializa la FIEL de forma homogénea para todos los endpoints."""
+    try:
+        # Intentar inicialización directa
         return Fiel(cer_bytes, key_bytes, password)
-    except Exception as e:
-        logger.error(f"Error cargando Fiel: {e}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Error al validar e.firma o contraseña: {str(e)}"
-        )
+    except Exception:
+        # Si falla por el formato de la llave, normalizarla
+        key_normalizada = normalizar_llave_privada(key_bytes, password)
+        return Fiel(cer_bytes, key_normalizada, password)
 
 def obtener_rfc_de_certificado(cer_bytes: bytes) -> str:
     """Extrae el RFC del titular directamente del archivo .cer (X.509)."""
     try:
         cert = x509.load_der_x509_certificate(cer_bytes)
         for attr in cert.subject:
-            # OID 2.5.4.5 (serialNumber) o 2.5.4.45 en certificados emitidos por el SAT
             if attr.oid._name in ("serialNumber", "x500UniqueIdentifier") or attr.oid.dotted_string == "2.5.4.5":
                 val = attr.value.strip()
-                # En el SAT suele venir formato 'RFC / CURP' o 'RFC'
                 if " " in val:
                     val = val.split(" ")[0]
                 if "/" in val:
@@ -75,7 +100,7 @@ def obtener_rfc_de_certificado(cer_bytes: bytes) -> str:
     return ""
 
 def resolver_rfc(rfc_param: Optional[str], cer_bytes: bytes) -> str:
-    """Determina el RFC prioritario (parámetro de formulario o certificado)."""
+    """Determina el RFC prioritario."""
     if rfc_param and rfc_param.strip():
         return rfc_param.strip().upper()
     rfc_extraido = obtener_rfc_de_certificado(cer_bytes)
@@ -83,7 +108,7 @@ def resolver_rfc(rfc_param: Optional[str], cer_bytes: bytes) -> str:
         return rfc_extraido
     raise HTTPException(
         status_code=400,
-        detail="No se pudo determinar el RFC. Asegúrate de enviarlo en el formulario o usar un certificado .cer válido."
+        detail="No se pudo determinar el RFC. Envíe el RFC en el formulario o verifique el .cer."
     )
 
 def obtener_token_fresco(fiel: Fiel) -> str:
@@ -92,7 +117,7 @@ def obtener_token_fresco(fiel: Fiel) -> str:
         auth = Autenticacion(fiel)
         token = auth.obtener_token()
         if not token:
-            raise Exception("El SAT no devolvió un token de sesión.")
+            raise Exception("El SAT no devolvió token.")
         return token
     except Exception as e:
         logger.error(f"Error obteniendo token SAT: {e}")
@@ -123,7 +148,7 @@ def extraer_xmls(paquete_data) -> list:
     try:
         with zipfile.ZipFile(io.BytesIO(paquete_bytes)) as z_padre:
             nombres = z_padre.namelist()
-            logger.info(f"Archivos en el ZIP del SAT ({len(nombres)}): {nombres[:10]}")
+            logger.info(f"Nombres en el ZIP del SAT ({len(nombres)} archivos): {nombres[:10]}")
             for nombre in nombres:
                 contenido = z_padre.read(nombre)
                 if nombre.lower().endswith(".zip"):
@@ -157,8 +182,8 @@ def ruta_raiz():
     return {
         "status": "ok",
         "servicio": "SAT Descarga Masiva API",
-        "motor": "cfdiclient-oficial",
-        "version": "5.1.0"
+        "motor": "cfdiclient-normalizado",
+        "version": "5.2.0"
     }
 
 @app.post("/api/sat/solicitar")
@@ -280,9 +305,12 @@ async def descargar_paquete(
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
+    # Mismo cargador normalizado y robusto
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
     token = obtener_token_fresco(fiel)
     rfc_solicitante = resolver_rfc(rfc, cer_bytes)
+
+    logger.info(f"Descargando paquete {id_paquete} para RFC {rfc_solicitante}")
 
     try:
         descargador = DescargaMasiva(fiel)
@@ -300,7 +328,7 @@ async def descargar_paquete(
         if not xmls:
             raise HTTPException(
                 status_code=500,
-                detail=f"El paquete {id_paquete} fue entregado por el SAT pero no contenía archivos XML legibles."
+                detail=f"El paquete {id_paquete} no contenía archivos XML legibles."
             )
 
         return {
