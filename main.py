@@ -1,66 +1,46 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
 import base64
 import zipfile
 import io
 
-# Componentes de manejo criptográfico del SAT
-from satcfdi.pfx import Fiel
+# Importaciones corregidas para la versión actual de satcfdi
+from satcfdi.signer import Signer
 from satcfdi.ws.consulta_masiva import ConsultaMasiva, TipoDescargaMasivaTerceros
 
 app = FastAPI(
     title="Microservicio de Descarga Masiva SAT",
-    description="Backend puente entre Lovable y el Web Service SOAP del SAT",
+    description="Backend puente para Lovable",
     version="1.0.0"
 )
 
-# Configuración de CORS para admitir llamadas desde el frontend de Lovable
+# Permitir conexiones desde cualquier origen (Lovable)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción, restringe al dominio específico de Lovable
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Modelos de Petición
-# ---------------------------------------------------------------------------
-
-class SolicitudMasivaRequest(BaseModel):
-    rfc_solicitante: str
-    fecha_inicio: str  # Formato: YYYY-MM-DD
-    fecha_fin: str     # Formato: YYYY-MM-DD
-    tipo: str          # "emitidos" o "recibidos"
-    tipo_solicitud: str = "CFDI"  # "CFDI" o "Metadata"
-
-class VerificacionRequest(BaseModel):
-    id_solicitud: str
-    rfc_solicitante: str
-
-# ---------------------------------------------------------------------------
-# Funciones Utilitarias
-# ---------------------------------------------------------------------------
-
-def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
-    """Carga y valida los certificados de la e.firma en memoria."""
+def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str):
+    """Carga y valida los certificados de la e.firma."""
     try:
-        return Fiel(
-            cer=cer_bytes,
+        return Signer.load(
+            certificate=cer_bytes,
             key=key_bytes,
             password=password.encode("utf-8")
         )
     except Exception as e:
         raise HTTPException(
             status_code=400, 
-            detail=f"Error autenticando con la e.firma: Verifique certificados y contraseña ({str(e)})"
+            detail=f"Error al autenticar con la e.firma: Verifique certificados y contraseña ({str(e)})"
         )
 
-# ---------------------------------------------------------------------------
-# Endpoints de API
-# ---------------------------------------------------------------------------
+@app.get("/")
+def ruta_raiz():
+    return {"status": "ok", "mensaje": "El servidor del SAT está activo y funcionando"}
 
 @app.post("/api/sat/solicitar")
 async def solicitar_descarga(
@@ -72,23 +52,13 @@ async def solicitar_descarga(
     fecha_fin: str = Form(...),
     tipo: str = Form(...)  # "emitidos" o "recibidos"
 ):
-    """
-    Paso 1: Genera el token de sesión SOAP, firma la petición y obtiene el IdSolicitud.
-    """
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
     cliente = ConsultaMasiva(fiel=fiel)
 
-    tipo_descarga = (
-        TipoDescargaMasivaTerceros.EMITIDOS 
-        if tipo.lower() == "emitidos" 
-        else TipoDescargaMasivaTerceros.RECIBIDOS
-    )
-
     try:
-        # Petición asíncrona al servicio del SAT
         resultado = cliente.solicita(
             rfc_emisor=rfc if tipo.lower() == "emitidos" else None,
             rfc_receptor=rfc if tipo.lower() == "recibidos" else None,
@@ -96,7 +66,6 @@ async def solicitar_descarga(
             fecha_final=f"{fecha_fin}T23:59:59",
             tipo_solicitud="CFDI"
         )
-        
         return {
             "status": "success",
             "id_solicitud": resultado.get("IdSolicitud"),
@@ -106,7 +75,6 @@ async def solicitar_descarga(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Falla al conectar con el SAT: {str(e)}")
 
-
 @app.post("/api/sat/verificar")
 async def verificar_solicitud(
     cer_file: UploadFile = File(...),
@@ -114,11 +82,6 @@ async def verificar_solicitud(
     password: str = Form(...),
     id_solicitud: str = Form(...)
 ):
-    """
-    Paso 2: Consulta si el SAT ya terminó de procesar el paquete.
-    Estados comunes:
-    1 = Aceptada, 2 = En proceso, 3 = Terminada, 4 = Error, 5 = Rechazada, 6 = Vencida
-    """
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
@@ -127,8 +90,6 @@ async def verificar_solicitud(
 
     try:
         verificacion = cliente.verifica(id_solicitud=id_solicitud)
-        
-        # Paquetes generados por el SAT (lista de strings)
         paquetes = verificacion.get("IdsPaquetes", [])
 
         return {
@@ -142,7 +103,6 @@ async def verificar_solicitud(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error consultando estatus: {str(e)}")
 
-
 @app.post("/api/sat/descargar-paquete")
 async def descargar_paquete(
     cer_file: UploadFile = File(...),
@@ -150,9 +110,6 @@ async def descargar_paquete(
     password: str = Form(...),
     id_paquete: str = Form(...)
 ):
-    """
-    Paso 3: Descarga el paquete .zip codificado en Base64 y extrae los XMLs a memoria.
-    """
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
@@ -166,7 +123,6 @@ async def descargar_paquete(
         if not paquete_b64:
             raise HTTPException(status_code=404, detail="El SAT no devolvió contenido para este paquete.")
 
-        # Descomprimir en memoria y procesar los XMLs
         archivo_zip = io.BytesIO(base64.b64decode(paquete_b64))
         xml_list = []
 
@@ -184,6 +140,5 @@ async def descargar_paquete(
             "total_xmls": len(xml_list),
             "comprobantes": xml_list
         }
-
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error en la descarga del paquete: {str(e)}")
