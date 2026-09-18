@@ -1,12 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+from typing import Optional
+from cryptography import x509
 import base64
 import zipfile
 import io
 import logging
 
-# Clases oficiales de cfdiclient 1.6.3
+# Clases oficiales de cfdiclient
 from cfdiclient import (
     Fiel,
     Autenticacion,
@@ -22,7 +24,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio de Descarga Masiva SAT",
     description="Backend oficial cfdiclient para Lovable",
-    version="5.0.0"
+    version="5.1.0"
 )
 
 app.add_middleware(
@@ -34,7 +36,7 @@ app.add_middleware(
 )
 
 def parse_fecha(fecha_str: str, es_fin: bool = False) -> datetime:
-    """Convierte cadenas YYYY-MM-DD a objetos datetime requeridos por cfdiclient."""
+    """Convierte cadenas YYYY-MM-DD o ISO a objetos datetime requeridos por cfdiclient."""
     fecha_limpia = fecha_str.strip()
     if "T" in fecha_limpia:
         return datetime.fromisoformat(fecha_limpia)
@@ -44,7 +46,7 @@ def parse_fecha(fecha_str: str, es_fin: bool = False) -> datetime:
     return dt.replace(hour=0, minute=0, second=0)
 
 def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
-    """Inicializa la FIEL con cfdiclient (argumentos posicionales)."""
+    """Inicializa la FIEL con cfdiclient."""
     try:
         return Fiel(cer_bytes, key_bytes, password)
     except Exception as e:
@@ -54,13 +56,43 @@ def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
             detail=f"Error al validar e.firma o contraseña: {str(e)}"
         )
 
+def obtener_rfc_de_certificado(cer_bytes: bytes) -> str:
+    """Extrae el RFC del titular directamente del archivo .cer (X.509)."""
+    try:
+        cert = x509.load_der_x509_certificate(cer_bytes)
+        for attr in cert.subject:
+            # OID 2.5.4.5 (serialNumber) o 2.5.4.45 en certificados emitidos por el SAT
+            if attr.oid._name in ("serialNumber", "x500UniqueIdentifier") or attr.oid.dotted_string == "2.5.4.5":
+                val = attr.value.strip()
+                # En el SAT suele venir formato 'RFC / CURP' o 'RFC'
+                if " " in val:
+                    val = val.split(" ")[0]
+                if "/" in val:
+                    val = val.split("/")[0]
+                return val.strip().upper()
+    except Exception as e:
+        logger.warning(f"No se pudo extraer RFC del certificado: {e}")
+    return ""
+
+def resolver_rfc(rfc_param: Optional[str], cer_bytes: bytes) -> str:
+    """Determina el RFC prioritario (parámetro de formulario o certificado)."""
+    if rfc_param and rfc_param.strip():
+        return rfc_param.strip().upper()
+    rfc_extraido = obtener_rfc_de_certificado(cer_bytes)
+    if rfc_extraido:
+        return rfc_extraido
+    raise HTTPException(
+        status_code=400,
+        detail="No se pudo determinar el RFC. Asegúrate de enviarlo en el formulario o usar un certificado .cer válido."
+    )
+
 def obtener_token_fresco(fiel: Fiel) -> str:
-    """Genera un token nuevo en cada llamada para evitar expiración (5 min)."""
+    """Genera un token de autorización en cada llamada."""
     try:
         auth = Autenticacion(fiel)
         token = auth.obtener_token()
         if not token:
-            raise Exception("El SAT no devolvió token.")
+            raise Exception("El SAT no devolvió un token de sesión.")
         return token
     except Exception as e:
         logger.error(f"Error obteniendo token SAT: {e}")
@@ -70,7 +102,7 @@ def obtener_token_fresco(fiel: Fiel) -> str:
         )
 
 def extraer_xmls(paquete_data) -> list:
-    """Decodifica Base64 y extrae XMLs directos o anidados en .zip."""
+    """Decodifica Base64 y extrae XMLs de paquetes simples y anidados."""
     if not paquete_data:
         return []
 
@@ -91,7 +123,7 @@ def extraer_xmls(paquete_data) -> list:
     try:
         with zipfile.ZipFile(io.BytesIO(paquete_bytes)) as z_padre:
             nombres = z_padre.namelist()
-            logger.info(f"Nombres en el ZIP del SAT ({len(nombres)} archivos): {nombres[:10]}")
+            logger.info(f"Archivos en el ZIP del SAT ({len(nombres)}): {nombres[:10]}")
             for nombre in nombres:
                 contenido = z_padre.read(nombre)
                 if nombre.lower().endswith(".zip"):
@@ -111,7 +143,7 @@ def extraer_xmls(paquete_data) -> list:
                         "xml_contenido": contenido.decode("utf-8", errors="ignore")
                     })
     except Exception as e:
-        logger.error(f"Error leyendo ZIP: {e}")
+        logger.error(f"Error procesando ZIP: {e}")
 
     logger.info(f"Total XMLs extraídos: {len(xmls)}")
     return xmls
@@ -126,7 +158,7 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva API",
         "motor": "cfdiclient-oficial",
-        "version": "5.0.0"
+        "version": "5.1.0"
     }
 
 @app.post("/api/sat/solicitar")
@@ -147,30 +179,30 @@ async def solicitar_descarga(
 
     f_inicio_dt = parse_fecha(fecha_inicio, es_fin=False)
     f_fin_dt = parse_fecha(fecha_fin, es_fin=True)
-    rfc_limpio = rfc.strip().upper()
+    rfc_solicitante = resolver_rfc(rfc, cer_bytes)
     es_emitidos = tipo.lower() == "emitidos"
 
-    logger.info(f"Solicitando {tipo} para RFC {rfc_limpio} de {f_inicio_dt} a {f_fin_dt}")
+    logger.info(f"Solicitando {tipo} para RFC {rfc_solicitante} ({f_inicio_dt} a {f_fin_dt})")
 
     try:
         if es_emitidos:
             descarga = SolicitaDescargaEmitidos(fiel)
             res = descarga.solicitar_descarga(
                 token=token,
-                rfc_solicitante=rfc_limpio,
+                rfc_solicitante=rfc_solicitante,
                 fecha_inicial=f_inicio_dt,
                 fecha_final=f_fin_dt,
-                rfc_emisor=rfc_limpio,
+                rfc_emisor=rfc_solicitante,
                 tipo_solicitud="CFDI"
             )
         else:
             descarga = SolicitaDescargaRecibidos(fiel)
             res = descarga.solicitar_descarga(
                 token=token,
-                rfc_solicitante=rfc_limpio,
+                rfc_solicitante=rfc_solicitante,
                 fecha_inicial=f_inicio_dt,
                 fecha_final=f_fin_dt,
-                rfc_receptor=rfc_limpio,
+                rfc_receptor=rfc_solicitante,
                 tipo_solicitud="CFDI"
             )
 
@@ -201,19 +233,21 @@ async def verificar_solicitud(
     cer_file: UploadFile = File(...),
     key_file: UploadFile = File(...),
     password: str = Form(...),
-    id_solicitud: str = Form(...)
+    id_solicitud: str = Form(...),
+    rfc: Optional[str] = Form(None)
 ):
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
     token = obtener_token_fresco(fiel)
+    rfc_solicitante = resolver_rfc(rfc, cer_bytes)
 
     try:
         verificador = VerificaSolicitudDescarga(fiel)
         res = verificador.verificar_descarga(
             token=token,
-            rfc_solicitante=fiel.rfc,
+            rfc_solicitante=rfc_solicitante,
             id_solicitud=id_solicitud
         )
 
@@ -240,19 +274,21 @@ async def descargar_paquete(
     cer_file: UploadFile = File(...),
     key_file: UploadFile = File(...),
     password: str = Form(...),
-    id_paquete: str = Form(...)
+    id_paquete: str = Form(...),
+    rfc: Optional[str] = Form(None)
 ):
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
     token = obtener_token_fresco(fiel)
+    rfc_solicitante = resolver_rfc(rfc, cer_bytes)
 
     try:
         descargador = DescargaMasiva(fiel)
         res = descargador.descargar_paquete(
             token=token,
-            rfc_solicitante=fiel.rfc,
+            rfc_solicitante=rfc_solicitante,
             id_paquete=id_paquete
         )
 
