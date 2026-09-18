@@ -4,10 +4,10 @@ import base64
 import zipfile
 import io
 
-# Importaciones universales y estables de satcfdi
+# Importaciones oficiales para satcfdi versión 2026+
 import satcfdi
-from satcfdi import Signer
-from satcfdi.ws.consulta_masiva import ConsultaMasiva, TipoDescargaMasivaTerceros
+from satcfdi.models import Certificate
+from satcfdi.portal import PortalDescargaMasiva
 
 app = FastAPI(
     title="Microservicio de Descarga Masiva SAT",
@@ -26,10 +26,11 @@ app.add_middleware(
 def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str):
     """Carga y valida los certificados de la e.firma en memoria."""
     try:
-        # En satcfdi 2026+ Signer acepta directamente los bytes o el método load
-        if hasattr(Signer, "load"):
-            return Signer.load(certificate=cer_bytes, key=key_bytes, password=password.encode("utf-8"))
-        return Signer(cer=cer_bytes, key=key_bytes, password=password.encode("utf-8"))
+        return Certificate(
+            certificate=cer_bytes,
+            key=key_bytes,
+            password=password.encode("utf-8")
+        )
     except Exception as e:
         raise HTTPException(
             status_code=400, 
@@ -41,7 +42,7 @@ def ruta_raiz():
     return {
         "status": "ok", 
         "servicio": "SAT Descarga Masiva API", 
-        "version_libreria": getattr(satcfdi, "__version__", "activa")
+        "version_satcfdi": getattr(satcfdi, "__version__", "activa")
     }
 
 @app.post("/api/sat/solicitar")
@@ -58,7 +59,7 @@ async def solicitar_descarga(
     key_bytes = await key_file.read()
 
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
-    cliente = ConsultaMasiva(fiel=fiel)
+    cliente = PortalDescargaMasiva(fiel=fiel)
 
     try:
         resultado = cliente.solicita(
@@ -88,7 +89,7 @@ async def verificar_solicitud(
     key_bytes = await key_file.read()
 
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
-    cliente = ConsultaMasiva(fiel=fiel)
+    cliente = PortalDescargaMasiva(fiel=fiel)
 
     try:
         verificacion = cliente.verifica(id_solicitud=id_solicitud)
@@ -116,7 +117,7 @@ async def descargar_paquete(
     key_bytes = await key_file.read()
 
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
-    cliente = ConsultaMasiva(fiel=fiel)
+    cliente = PortalDescargaMasiva(fiel=fiel)
 
     try:
         respuesta_descarga = cliente.descarga(id_paquete=id_paquete)
