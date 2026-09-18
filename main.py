@@ -6,10 +6,10 @@ import zipfile
 import io
 import logging
 
-# Clases oficiales de cfdiclient para el Web Service SOAP del SAT
-from cfdiclient import (
-    Fiel,
-    Autenticacion,
+# Rutas internas exactas del paquete cfdiclient
+from cfdiclient.fiel import Fiel
+from cfdiclient.autenticacion import Autenticacion
+from cfdiclient.descarga_masiva import (
     SolicitaDescarga,
     VerificaSolicitudDescarga,
     DescargaMasiva
@@ -21,7 +21,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio de Descarga Masiva SAT",
     description="Backend puente con cfdiclient para Lovable",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -41,33 +41,33 @@ def formatear_fecha_sat(fecha_str: str, es_fin: bool = False) -> str:
     return fecha_limpia
 
 def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
-    """Carga los certificados de la e.firma con cfdiclient (argumentos posicionales)."""
+    """Carga los certificados de la e.firma con argumentos posicionales."""
     try:
         return Fiel(cer_bytes, key_bytes, password)
     except Exception as e:
         logger.error(f"Error cargando Fiel: {e}")
         raise HTTPException(
             status_code=400, 
-            detail=f"Error al validar e.firma o contraseña: {str(e)}"
+            detail=f"Error validando e.firma o contraseña: {str(e)}"
         )
 
 def obtener_token(fiel: Fiel) -> str:
-    """Obtiene el token de sesión autenticado contra el SAT."""
+    """Obtiene el token de autenticación del Web Service del SAT."""
     try:
         auth = Autenticacion(fiel)
         token = auth.obtener_token()
         if not token:
-            raise Exception("El SAT no devolvió un token de autorización.")
+            raise Exception("El SAT no generó un token válido.")
         return token
     except Exception as e:
-        logger.error(f"Falla de autenticación en el SAT: {e}")
+        logger.error(f"Error en Autenticacion SAT: {e}")
         raise HTTPException(
             status_code=401, 
-            detail=f"No se pudo autenticar con el SAT: {str(e)}"
+            detail=f"Falla de autenticación con el SAT: {str(e)}"
         )
 
 def extraer_xmls_recursivo(paquete_data) -> list:
-    """Extrae XMLs manejando Base64 y paquetes anidados (.zip dentro de .zip)."""
+    """Extrae XMLs manejando Base64 y paquetes ZIP anidados."""
     if isinstance(paquete_data, str):
         try:
             paquete_bytes = base64.b64decode(paquete_data)
@@ -97,7 +97,7 @@ def extraer_xmls_recursivo(paquete_data) -> list:
                                         "xml_contenido": c_xml
                                     })
                     except Exception as e_zip:
-                        logger.warning(f"Error abriendo ZIP interno {nombre}: {e_zip}")
+                        logger.warning(f"Error abriendo sub-ZIP {nombre}: {e_zip}")
                 elif nombre.lower().endswith(".xml"):
                     c_xml = contenido.decode("utf-8", errors="ignore")
                     xml_encontrados.append({
@@ -105,7 +105,7 @@ def extraer_xmls_recursivo(paquete_data) -> list:
                         "xml_contenido": c_xml
                     })
     except Exception as e:
-        logger.error(f"Error descomprimiendo paquete: {str(e)}")
+        logger.error(f"Error descomprimiendo paquete ZIP: {str(e)}")
 
     return xml_encontrados
 
@@ -115,7 +115,7 @@ def ruta_raiz():
         "status": "ok", 
         "servicio": "SAT Descarga Masiva API",
         "motor": "cfdiclient",
-        "version": "2.0.0"
+        "version": "2.1.0"
     }
 
 @app.post("/api/sat/solicitar")
@@ -137,8 +137,6 @@ async def solicitar_descarga(
     f_fin = formatear_fecha_sat(fecha_fin, es_fin=True)
     rfc_limpio = rfc.strip().upper()
     es_emitidos = tipo.lower() == "emitidos"
-
-    logger.info(f"Solicitando {tipo} para RFC {rfc_limpio} de {f_inicio} a {f_fin}")
 
     try:
         cliente_solicita = SolicitaDescarga(fiel)
@@ -163,10 +161,9 @@ async def solicitar_descarga(
                 detail=f"SAT Código {cod_estatus}: {res.get('mensaje', res.get('Mensaje', 'Error en la solicitud'))}"
             )
 
-        id_solicitud = res.get("id_solicitud", res.get("IdSolicitud"))
         return {
             "status": "success",
-            "id_solicitud": id_solicitud,
+            "id_solicitud": res.get("id_solicitud", res.get("IdSolicitud")),
             "codigo_estatus": cod_estatus,
             "mensaje": res.get("mensaje", res.get("Mensaje", "Solicitud aceptada"))
         }
@@ -210,7 +207,7 @@ async def verificar_solicitud(
         }
     except Exception as e:
         logger.error(f"Error en verificar_descarga: {e}")
-        raise HTTPException(status_code=502, detail=f"Error al consultar estado al SAT: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Error consultando estado al SAT: {str(e)}")
 
 @app.post("/api/sat/descargar-paquete")
 async def descargar_paquete(
@@ -248,4 +245,4 @@ async def descargar_paquete(
         raise
     except Exception as e:
         logger.error(f"Error en descargar_paquete: {e}")
-        raise HTTPException(status_code=502, detail=f"Error al descargar el paquete del SAT: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Error descargando paquete del SAT: {str(e)}")
