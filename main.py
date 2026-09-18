@@ -4,11 +4,6 @@ import base64
 import zipfile
 import io
 
-# Importaciones oficiales para satcfdi versión 2026+
-import satcfdi
-from satcfdi.models import Certificate
-from satcfdi.portal import PortalDescargaMasiva
-
 app = FastAPI(
     title="Microservicio de Descarga Masiva SAT",
     description="Backend puente para Lovable",
@@ -23,26 +18,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Carga dinámica y segura de la librería satcfdi
+# ---------------------------------------------------------------------------
+def obtener_herramientas_sat():
+    """Localiza las clases de firma y descarga masiva en la librería instalada."""
+    import satcfdi
+    
+    # Localizar clase para firma
+    signer_cls = None
+    for mod_name in ['satcfdi.models', 'satcfdi.signer', 'satcfdi.pfx', 'satcfdi']:
+        try:
+            m = __import__(mod_name, fromlist=['Certificate', 'Signer', 'Fiel'])
+            signer_cls = getattr(m, 'Certificate', getattr(m, 'Signer', getattr(m, 'Fiel', None)))
+            if signer_cls:
+                break
+        except ImportError:
+            continue
+
+    # Localizar clase para descarga masiva
+    ws_cls = None
+    for mod_name in ['satcfdi.ws.consulta_masiva', 'satcfdi.portal', 'satcfdi.ws']:
+        try:
+            m = __import__(mod_name, fromlist=['ConsultaMasiva', 'PortalDescargaMasiva', 'DescargaMasiva'])
+            ws_cls = getattr(m, 'ConsultaMasiva', getattr(m, 'PortalDescargaMasiva', getattr(m, 'DescargaMasiva', None)))
+            if ws_cls:
+                break
+        except ImportError:
+            continue
+
+    return signer_cls, ws_cls
+
 def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str):
-    """Carga y valida los certificados de la e.firma en memoria."""
+    """Carga y valida los certificados de la e.firma."""
+    signer_cls, _ = obtener_herramientas_sat()
+    if not signer_cls:
+        raise HTTPException(status_code=500, detail="Módulo criptográfico no encontrado en satcfdi")
+    
     try:
-        return Certificate(
-            certificate=cer_bytes,
-            key=key_bytes,
-            password=password.encode("utf-8")
-        )
+        # Intenta métodos comunes de inicialización
+        if hasattr(signer_cls, "load"):
+            return signer_cls.load(certificate=cer_bytes, key=key_bytes, password=password.encode("utf-8"))
+        try:
+            return signer_cls(cer=cer_bytes, key=key_bytes, password=password.encode("utf-8"))
+        except TypeError:
+            return signer_cls(certificate=cer_bytes, key=key_bytes, password=password.encode("utf-8"))
     except Exception as e:
         raise HTTPException(
             status_code=400, 
-            detail=f"Error con los archivos de la e.firma o contraseña: {str(e)}"
+            detail=f"Error validando e.firma o contraseña: {str(e)}"
         )
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 @app.get("/")
 def ruta_raiz():
+    signer_cls, ws_cls = obtener_herramientas_sat()
     return {
         "status": "ok", 
-        "servicio": "SAT Descarga Masiva API", 
-        "version_satcfdi": getattr(satcfdi, "__version__", "activa")
+        "servicio": "SAT Descarga Masiva API",
+        "modulo_firma": bool(signer_cls),
+        "modulo_ws": bool(ws_cls)
     }
 
 @app.post("/api/sat/solicitar")
@@ -55,11 +93,14 @@ async def solicitar_descarga(
     fecha_fin: str = Form(...),
     tipo: str = Form(...)  # "emitidos" o "recibidos"
 ):
+    _, ws_cls = obtener_herramientas_sat()
+    if not ws_cls:
+        raise HTTPException(status_code=500, detail="Módulo de consulta masiva no disponible")
+
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
-
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
-    cliente = PortalDescargaMasiva(fiel=fiel)
+    cliente = ws_cls(fiel=fiel)
 
     try:
         resultado = cliente.solicita(
@@ -85,11 +126,14 @@ async def verificar_solicitud(
     password: str = Form(...),
     id_solicitud: str = Form(...)
 ):
+    _, ws_cls = obtener_herramientas_sat()
+    if not ws_cls:
+        raise HTTPException(status_code=500, detail="Módulo de consulta masiva no disponible")
+
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
-
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
-    cliente = PortalDescargaMasiva(fiel=fiel)
+    cliente = ws_cls(fiel=fiel)
 
     try:
         verificacion = cliente.verifica(id_solicitud=id_solicitud)
@@ -113,15 +157,18 @@ async def descargar_paquete(
     password: str = Form(...),
     id_paquete: str = Form(...)
 ):
+    _, ws_cls = obtener_herramientas_sat()
+    if not ws_cls:
+        raise HTTPException(status_code=500, detail="Módulo de consulta masiva no disponible")
+
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
-
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
-    cliente = PortalDescargaMasiva(fiel=fiel)
+    cliente = ws_cls(fiel=fiel)
 
     try:
-        respuesta_descarga = cliente.descarga(id_paquete=id_paquete)
-        paquete_b64 = respuesta_descarga.get("PaqueteB64")
+        respuesta = cliente.descarga(id_paquete=id_paquete)
+        paquete_b64 = respuesta.get("PaqueteB64")
 
         if not paquete_b64:
             raise HTTPException(status_code=404, detail="El SAT no devolvió contenido para este paquete.")
@@ -144,4 +191,4 @@ async def descargar_paquete(
             "comprobantes": xml_list
         }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Error en la descarga del paquete: {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Error descargando paquete: {str(e)}")
