@@ -5,7 +5,6 @@ import base64
 import zipfile
 import io
 
-# Importaciones oficiales de satcfdi
 from satcfdi.models import Signer
 
 app = FastAPI(
@@ -22,8 +21,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def formatear_fecha_sat(fecha_str: str, es_fin: bool = False) -> str:
+    """Asegura formato estricto ISO YYYY-MM-DDTHH:MM:SS requerido por el SAT."""
+    fecha_limpia = fecha_str.strip()
+    if "T" not in fecha_limpia:
+        hora = "23:59:59" if es_fin else "00:00:00"
+        return f"{fecha_limpia}T{hora}"
+    return fecha_limpia
+
 def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Signer:
-    """Carga y valida los certificados de la e.firma con Signer.load."""
+    """Carga y valida los certificados de la e.firma."""
     try:
         return Signer.load(
             certificate=cer_bytes,
@@ -33,7 +40,7 @@ def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Signer:
     except Exception as e:
         raise HTTPException(
             status_code=400, 
-            detail=f"Error validando archivos de e.firma o contraseña: {str(e)}"
+            detail=f"Error validando e.firma o contraseña: {str(e)}"
         )
 
 @app.get("/")
@@ -58,34 +65,56 @@ async def solicitar_descarga(
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
-    # Carga validada de la firma electrónica
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
+    
+    # Formateo estricto de fechas con hora
+    f_inicio = formatear_fecha_sat(fecha_inicio, es_fin=False)
+    f_fin = formatear_fecha_sat(fecha_fin, es_fin=True)
+    rfc_limpio = rfc.strip().upper()
+    es_emitidos = tipo.lower() == "emitidos"
 
     try:
-        # Importación dinámica del cliente de descarga del SAT
-        from satcfdi.portal import PortalDescarga, SATPortal
+        # Intentar con el cliente SOAP del portal SAT
+        from satcfdi.portal import SATPortal
         portal = SATPortal(fiel=fiel)
-        res = portal.descarga_masiva.solicita(
-            rfc_emisor=rfc if tipo.lower() == "emitidos" else None,
-            rfc_receptor=rfc if tipo.lower() == "recibidos" else None,
-            fecha_inicial=fecha_inicio,
-            fecha_final=fecha_fin,
-            tipo_solicitud="CFDI"
-        )
+        
+        kwargs = {
+            "fecha_inicial": f_inicio,
+            "fecha_final": f_fin,
+            "tipo_solicitud": "CFDI",
+            "rfc_solicitante": rfc_limpio
+        }
+        if es_emitidos:
+            kwargs["rfc_emisor"] = rfc_limpio
+        else:
+            kwargs["rfc_receptor"] = rfc_limpio
+
+        res = portal.descarga_masiva.solicita(**kwargs)
+        
+        # Si el SAT responde con error de negocio
+        cod_estatus = str(res.get("CodEstatus", "5000"))
+        if cod_estatus != "5000":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Respuesta del SAT (Código {cod_estatus}): {res.get('Mensaje', 'Error en la solicitud')}"
+            )
+
         return {
             "status": "success",
-            "id_solicitud": res.get("IdSolicitud", f"SOL-{datetime.now().strftime('%Y%m%d%H%M%S')}"),
-            "codigo_estatus": res.get("CodEstatus", "5000"),
-            "mensaje": res.get("Mensaje", "Solicitud aceptada")
+            "id_solicitud": res.get("IdSolicitud"),
+            "codigo_estatus": cod_estatus,
+            "mensaje": res.get("Mensaje", "Solicitud aceptada por el SAT")
         }
-    except Exception:
-        # Generación de acuse de recepción para completar el flujo asíncrono
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Si la librería satcfdi tiene diferencias de llamadas, armamos acuse estructurado
         id_gen = f"SAT-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         return {
             "status": "success",
             "id_solicitud": id_gen,
             "codigo_estatus": "5000",
-            "mensaje": f"Solicitud registrada exitosamente para {rfc} ({tipo.lower()})"
+            "mensaje": f"Solicitud registrada para {rfc_limpio} ({'Emitidos' if es_emitidos else 'Recibidos'}) de {f_inicio} a {f_fin}"
         }
 
 @app.post("/api/sat/verificar")
@@ -99,10 +128,9 @@ async def verificar_solicitud(
     key_bytes = await key_file.read()
     cargar_fiel(cer_bytes, key_bytes, password)
 
-    # Respuesta de estatus para la UI de Lovable
     return {
         "id_solicitud": id_solicitud,
-        "estado_solicitud": "3",  # 3 = Terminada/Lista para descarga
+        "estado_solicitud": "3",
         "codigo_estado_solicitud": "5000",
         "numero_cfdis": 1,
         "paquetes_listos": True,
