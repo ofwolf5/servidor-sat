@@ -32,7 +32,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.7.0"
+    version="6.8.0"
 )
 
 app.add_middleware(
@@ -190,18 +190,10 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
         if await btn_efirma.is_visible(timeout=3000):
             await btn_efirma.click()
 
-        # 2. En formsloginFEA.asp, esperar a que termine de descargar las herramientas JS
-        try:
-            loading_msg = page.locator("text='Descargando las herramientas'")
-            if await loading_msg.is_visible(timeout=2000):
-                await loading_msg.wait_for(state="hidden", timeout=20000)
-        except Exception:
-            pass
-
-        # 3. Localizar inputs de archivo en el DOM
+        # 2. Esperar campos de archivos
         await page.wait_for_selector("input[type='file'], input#cert, input#fileCertificate", state="attached", timeout=25000)
 
-        # Cargar Certificado (.cer)
+        # 3. Cargar Certificado (.cer)
         cer_input = page.locator("input#cert, input#fileCertificate, input[name*='cert']").first
         if await cer_input.count() > 0:
             await cer_input.set_input_files(cer_path)
@@ -210,9 +202,9 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
             await page.locator("input[type='file']").nth(0).set_input_files(cer_path)
             await page.locator("input[type='file']").nth(0).dispatch_event("change")
 
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(800)
 
-        # Cargar Clave Privada (.key)
+        # 4. Cargar Clave Privada (.key)
         key_input = page.locator("input#key, input#filePrivateKey, input[name*='key']").first
         if await key_input.count() > 0:
             await key_input.set_input_files(key_path)
@@ -221,37 +213,29 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
             await page.locator("input[type='file']").nth(1).set_input_files(key_path)
             await page.locator("input[type='file']").nth(1).dispatch_event("change")
 
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(800)
 
-        # Contraseña de clave privada
+        # 5. Contraseña de clave privada
         pwd_input = page.locator("input#password, input#privateKeyPassword, input#txtPassword, input[type='password']").first
         await pwd_input.fill(password)
         await pwd_input.dispatch_event("change")
         await pwd_input.dispatch_event("blur")
 
-        # RFC (si existe el campo en el formulario y no fue auto-llenado por el JS del SAT)
-        rfc_input = page.locator("input#rfc, input#txtRfc, input[name*='rfc'], input[name*='RFC']").first
-        if await rfc_input.count() > 0:
-            val_actual = await rfc_input.input_value()
-            if not val_actual and rfc:
-                await rfc_input.fill(rfc.strip().upper())
-                await rfc_input.dispatch_event("change")
-                await rfc_input.dispatch_event("blur")
+        # 6. Esperar a que el script del SAT procese el .cer y auto-llene el RFC o 2 segundos
+        await page.wait_for_timeout(2000)
 
-        await page.wait_for_timeout(1000)
-
-        # 4. Enviar formulario
+        # 7. Enviar formulario
         btn_submit = page.locator("input#submit, button#submit, input[type='submit'], input[value*='Enviar'], button:has-text('Enviar'), input#btnSubmit").first
         await btn_submit.click()
 
-        # 5. Esperar a que la página cambie de URL (salga de la pantalla de login)
+        # 8. Esperar a que la página cambie de URL (salga de la pantalla de login)
         try:
             await page.wait_for_url(
                 lambda url: "formslogin" not in url.lower() and "nidp" not in url.lower() and "login" not in url.lower(),
                 timeout=30000
             )
         except Exception:
-            # Si no avanzó, extraer el mensaje de error que pinto el SAT en la página
+            # Extraer posibles mensajes de error en rojo
             error_locators = page.locator(".msg-error, #error, #lblError, font[color='red'], span[style*='red'], div[class*='error']")
             mensajes = await error_locators.all_text_contents()
             error_limpio = " ".join([m.strip() for m in mensajes if m.strip()])
@@ -291,7 +275,6 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
             page = await context.new_page()
 
             try:
-                # URL oficial de reimpresión de acuses del SAT
                 url_cif = "https://www.acuse.sat.gob.mx/ReimpresionInternet/REIMDefault.htm"
                 await page.goto(url_cif, wait_until="domcontentloaded", timeout=70000)
 
@@ -456,12 +439,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.7.0"
+        "version": "6.8.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.7.0"}
+    return {"status": "healthy", "version": "6.8.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
