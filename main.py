@@ -7,7 +7,13 @@ from cryptography.hazmat.primitives import serialization
 import base64
 import zipfile
 import io
+import os
+import re
+import tempfile
 import logging
+
+from playwright.async_api import async_playwright
+import pypdf
 
 from cfdiclient import (
     Fiel,
@@ -22,9 +28,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sat_service")
 
 app = FastAPI(
-    title="Microservicio de Descarga Masiva SAT",
-    description="Backend oficial cfdiclient para Lovable",
-    version="5.2.0"
+    title="Microservicio SAT Integral",
+    description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D",
+    version="6.0.0"
 )
 
 app.add_middleware(
@@ -35,8 +41,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Utilidades Criptográficas y CFDIClient
+# ---------------------------------------------------------------------------
+
 def parse_fecha(fecha_str: str, es_fin: bool = False) -> datetime:
-    """Convierte cadenas YYYY-MM-DD o ISO a objetos datetime requeridos por cfdiclient."""
     fecha_limpia = fecha_str.strip()
     if "T" in fecha_limpia:
         return datetime.fromisoformat(fecha_limpia)
@@ -46,18 +55,11 @@ def parse_fecha(fecha_str: str, es_fin: bool = False) -> datetime:
     return dt.replace(hour=0, minute=0, second=0)
 
 def normalizar_llave_privada(key_bytes: bytes, password: str) -> bytes:
-    """
-    Carga la llave .key del SAT (DER PKCS#8 cifrada o PEM)
-    y asegura que cfdiclient pueda procesarla sin errores de formato.
-    """
     pwd_bytes = password.encode("utf-8") if isinstance(password, str) else password
-    
-    # 1. Intentar cargar como DER PKCS#8 (formato estándar nativo del SAT)
     try:
         priv_key = serialization.load_der_private_key(key_bytes, password=pwd_bytes)
     except Exception:
         try:
-            # 2. Intentar cargar como PEM
             priv_key = serialization.load_pem_private_key(key_bytes, password=pwd_bytes)
         except Exception as e_pem:
             logger.error(f"Falla al descifrar la llave privada con la contraseña: {e_pem}")
@@ -66,7 +68,6 @@ def normalizar_llave_privada(key_bytes: bytes, password: str) -> bytes:
                 detail=f"No se pudo descifrar el archivo .key. Verifique su contraseña: {str(e_pem)}"
             )
 
-    # Convertir a DER PKCS#8 estándar limpio para cfdiclient
     return priv_key.private_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PrivateFormat.PKCS8,
@@ -74,17 +75,13 @@ def normalizar_llave_privada(key_bytes: bytes, password: str) -> bytes:
     )
 
 def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
-    """Inicializa la FIEL de forma homogénea para todos los endpoints."""
     try:
-        # Intentar inicialización directa
         return Fiel(cer_bytes, key_bytes, password)
     except Exception:
-        # Si falla por el formato de la llave, normalizarla
         key_normalizada = normalizar_llave_privada(key_bytes, password)
         return Fiel(cer_bytes, key_normalizada, password)
 
 def obtener_rfc_de_certificado(cer_bytes: bytes) -> str:
-    """Extrae el RFC del titular directamente del archivo .cer (X.509)."""
     try:
         cert = x509.load_der_x509_certificate(cer_bytes)
         for attr in cert.subject:
@@ -100,7 +97,6 @@ def obtener_rfc_de_certificado(cer_bytes: bytes) -> str:
     return ""
 
 def resolver_rfc(rfc_param: Optional[str], cer_bytes: bytes) -> str:
-    """Determina el RFC prioritario."""
     if rfc_param and rfc_param.strip():
         return rfc_param.strip().upper()
     rfc_extraido = obtener_rfc_de_certificado(cer_bytes)
@@ -112,7 +108,6 @@ def resolver_rfc(rfc_param: Optional[str], cer_bytes: bytes) -> str:
     )
 
 def obtener_token_fresco(fiel: Fiel) -> str:
-    """Genera un token de autorización en cada llamada."""
     try:
         auth = Autenticacion(fiel)
         token = auth.obtener_token()
@@ -127,7 +122,6 @@ def obtener_token_fresco(fiel: Fiel) -> str:
         )
 
 def extraer_xmls(paquete_data) -> list:
-    """Decodifica Base64 y extrae XMLs de paquetes simples y anidados."""
     if not paquete_data:
         return []
 
@@ -148,7 +142,6 @@ def extraer_xmls(paquete_data) -> list:
     try:
         with zipfile.ZipFile(io.BytesIO(paquete_bytes)) as z_padre:
             nombres = z_padre.namelist()
-            logger.info(f"Nombres en el ZIP del SAT ({len(nombres)} archivos): {nombres[:10]}")
             for nombre in nombres:
                 contenido = z_padre.read(nombre)
                 if nombre.lower().endswith(".zip"):
@@ -170,20 +163,54 @@ def extraer_xmls(paquete_data) -> list:
     except Exception as e:
         logger.error(f"Error procesando ZIP: {e}")
 
-    logger.info(f"Total XMLs extraídos: {len(xmls)}")
     return xmls
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Automatización Portal SAT (Playwright)
+# ---------------------------------------------------------------------------
+
+async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str):
+    """Realiza el login interactivo por e.firma en el SSO del SAT."""
+    try:
+        # Selector de pestaña e.firma si el portal muestra CIEC por defecto
+        btn_efirma = page.locator("#buttonFiel, a[href*='fiel'], button:has-text('e.firma')").first
+        if await btn_efirma.is_visible(timeout=3000):
+            await btn_efirma.click()
+
+        # Esperar inputs de archivos
+        await page.wait_for_selector("input[type='file']", timeout=15000)
+        
+        # Localización de campos de subida de archivos
+        file_inputs = await page.locator("input[type='file']").all()
+        if len(file_inputs) >= 2:
+            await file_inputs[0].set_input_files(cer_path)
+            await file_inputs[1].set_input_files(key_path)
+        else:
+            await page.set_input_files("input#fileCertificate, input[name*='cert']", cer_path)
+            await page.set_input_files("input#filePrivateKey, input[name*='key']", key_path)
+
+        # Contraseña de la clave privada
+        await page.fill("input#privateKeyPassword, input#txtPassword, input[type='password']", password)
+
+        # Enviar formulario
+        btn_submit = page.locator("input#submit, button#submit, input[type='submit'], button:has-text('Enviar')").first
+        await btn_submit.click()
+        await page.wait_for_load_state("networkidle", timeout=25000)
+    except Exception as e:
+        logger.error(f"Falla durante la autenticación e.firma: {e}")
+        raise HTTPException(status_code=401, detail=f"No se pudo completar el acceso con e.firma al SAT: {str(e)}")
+
+# ---------------------------------------------------------------------------
+# Endpoints Base y CFDI Descarga Masiva
 # ---------------------------------------------------------------------------
 
 @app.get("/")
 def ruta_raiz():
     return {
         "status": "ok",
-        "servicio": "SAT Descarga Masiva API",
-        "motor": "cfdiclient-normalizado",
-        "version": "5.2.0"
+        "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
+        "motor": "cfdiclient + playwright",
+        "version": "6.0.0"
     }
 
 @app.post("/api/sat/solicitar")
@@ -194,7 +221,7 @@ async def solicitar_descarga(
     rfc: str = Form(...),
     fecha_inicio: str = Form(...),
     fecha_fin: str = Form(...),
-    tipo: str = Form(...)  # "emitidos" o "recibidos"
+    tipo: str = Form(...)
 ):
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
@@ -305,12 +332,9 @@ async def descargar_paquete(
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
-    # Mismo cargador normalizado y robusto
     fiel = cargar_fiel(cer_bytes, key_bytes, password)
     token = obtener_token_fresco(fiel)
     rfc_solicitante = resolver_rfc(rfc, cer_bytes)
-
-    logger.info(f"Descargando paquete {id_paquete} para RFC {rfc_solicitante}")
 
     try:
         descargador = DescargaMasiva(fiel)
@@ -341,3 +365,157 @@ async def descargar_paquete(
     except Exception as e:
         logger.error(f"Error descargando paquete: {e}")
         raise HTTPException(status_code=502, detail=f"Error al descargar del SAT: {str(e)}")
+
+# ---------------------------------------------------------------------------
+# Nuevos Módulos: Opinión 32-D y Constancia de Situación Fiscal (CSF)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/sat/sync-opinion")
+async def obtener_opinion_cumplimiento(
+    cer_file: UploadFile = File(...),
+    key_file: UploadFile = File(...),
+    password: str = Form(...),
+    rfc: Optional[str] = Form(None)
+):
+    """Consulta y descarga la Opinión del Cumplimiento (32-D) en PDF y determina su estatus."""
+    cer_bytes = await cer_file.read()
+    key_bytes = await key_file.read()
+    rfc_contribuyente = resolver_rfc(rfc, cer_bytes)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cer_path = os.path.join(temp_dir, "fiel.cer")
+        key_path = os.path.join(temp_dir, "fiel.key")
+
+        with open(cer_path, "wb") as f_cer, open(key_path, "wb") as f_key:
+            f_cer.write(cer_bytes)
+            f_key.write(key_bytes)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(accept_downloads=True)
+            page = await context.new_page()
+
+            try:
+                # 1. Acceso a la URL oficial del trámite 32-D
+                url_opinion = "https://ptscdecypag.sat.gob.mx/OpinionCumplimiento/"
+                await page.goto(url_opinion, timeout=60000)
+
+                # Si redirige al login del SAT
+                if "login" in page.url.lower() or "nidp" in page.url.lower():
+                    await autenticar_portal_sat(page, cer_path, key_path, password)
+
+                # 2. Esperar generación y descarga del PDF
+                async with page.expect_download(timeout=45000) as download_info:
+                    # El portal puede descargar automáticamente o requerir clic
+                    btn_descarga = page.locator("button:has-text('Descargar'), a:has-text('Guardar')").first
+                    if await btn_descarga.is_visible():
+                        await btn_descarga.click()
+
+                download = await download_info.value
+                pdf_path = os.path.join(temp_dir, "opinion_32d.pdf")
+                await download.save_as(pdf_path)
+
+                # 3. Lectura de contenido y extracción del veredicto
+                with open(pdf_path, "rb") as pdf_file:
+                    pdf_bytes = pdf_file.read()
+
+                reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+                texto_completo = "".join([pg.extract_text() or "" for pg in reader.pages]).upper()
+
+                if "POSITIVO" in texto_completo:
+                    status = "POSITIVA"
+                elif "NEGATIVO" in texto_completo:
+                    status = "NEGATIVA"
+                elif "NO INSCRITO" in texto_completo or "SIN OBLIGACIONES" in texto_completo:
+                    status = "SIN_OPINION"
+                else:
+                    status = "REVISION"
+
+                pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+
+                return {
+                    "status": "success",
+                    "rfc": rfc_contribuyente,
+                    "opinion_status": status,
+                    "pdf_base64": pdf_b64,
+                    "fecha_consulta": datetime.now().isoformat()
+                }
+
+            except Exception as e:
+                logger.error(f"Error consultando 32-D: {e}")
+                raise HTTPException(status_code=502, detail=f"Falla al generar Opinión de Cumplimiento: {str(e)}")
+            finally:
+                await browser.close()
+
+@app.post("/api/sat/sync-csf")
+async def obtener_csf(
+    cer_file: UploadFile = File(...),
+    key_file: UploadFile = File(...),
+    password: str = Form(...),
+    rfc: Optional[str] = Form(None)
+):
+    """Genera la Constancia de Situación Fiscal (CSF), extrae los datos clave y devuelve el PDF."""
+    cer_bytes = await cer_file.read()
+    key_bytes = await key_file.read()
+    rfc_contribuyente = resolver_rfc(rfc, cer_bytes)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cer_path = os.path.join(temp_dir, "fiel.cer")
+        key_path = os.path.join(temp_dir, "fiel.key")
+
+        with open(cer_path, "wb") as f_cer, open(key_path, "wb") as f_key:
+            f_cer.write(cer_bytes)
+            f_key.write(key_bytes)
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(accept_downloads=True)
+            page = await context.new_page()
+
+            try:
+                # 1. URL de reexpedición de CIF / CSF
+                url_cif = "https://www.sat.gob.mx/aplicacion/operacion/43824/reimprime-tus-acuses-del-rfc"
+                await page.goto(url_cif, timeout=60000)
+
+                if "login" in page.url.lower() or "nidp" in page.url.lower():
+                    await autenticar_portal_sat(page, cer_path, key_path, password)
+
+                # 2. Clic en botón "Generar Constancia"
+                btn_generar = page.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia']").first
+                await btn_generar.wait_for(state="visible", timeout=30000)
+
+                async with page.expect_popup() as popup_info:
+                    await btn_generar.click()
+                
+                popup = await popup_info.value
+                await popup.wait_for_load_state("networkidle")
+
+                # 3. Guardar el PDF generado por la ventana emergente
+                pdf_bytes = await popup.pdf() if hasattr(popup, "pdf") else None
+                if not pdf_bytes:
+                    # Captura mediante stream si la ventana responde como archivo directo
+                    pdf_bytes = await popup.body()
+
+                # 4. Extraer texto para actualizar perfil en base de datos
+                reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+                texto = "".join([pg.extract_text() or "" for pg in reader.pages])
+
+                # Búsqueda por expresiones regulares básicas en el layout de la CSF
+                cp_match = re.search(r"Código Postal:?\s*(\d{5})", texto, re.IGNORECASE)
+                codigo_postal = cp_match.group(1) if cp_match else ""
+
+                pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+
+                return {
+                    "status": "success",
+                    "rfc": rfc_contribuyente,
+                    "codigo_postal": codigo_postal,
+                    "pdf_base64": pdf_b64,
+                    "fecha_emision": datetime.now().isoformat()
+                }
+
+            except Exception as e:
+                logger.error(f"Error generando CSF: {e}")
+                raise HTTPException(status_code=502, detail=f"Falla al generar CSF: {str(e)}")
+            finally:
+                await browser.close()
