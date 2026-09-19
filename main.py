@@ -33,7 +33,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.13.0"
+    version="6.14.0"
 )
 
 app.add_middleware(
@@ -179,18 +179,16 @@ def extraer_xmls(paquete_data) -> list:
     return xmls
 
 # ---------------------------------------------------------------------------
-# Automatización Portal SAT (Playwright con clic robusto y multi-frame)
+# Automatización Portal SAT (Playwright)
 # ---------------------------------------------------------------------------
 
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str, rfc: str = ""):
-    """Realiza el login por e.firma asegurando la asignación correcta de archivos y tecleo real."""
+    """Realiza el login por e.firma validando la generación real del token criptográfico."""
     try:
-        # Pestaña e.firma si aparece
         btn_efirma = page.locator("#buttonFiel, a#btnFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
         if await btn_efirma.is_visible(timeout=3000):
             await btn_efirma.click()
 
-        # Esperar a que el SAT descargue sus herramientas criptográficas
         try:
             loading_msg = page.locator("text='Descargando las herramientas'")
             if await loading_msg.is_visible(timeout=2000):
@@ -200,7 +198,7 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
 
         await page.wait_for_selector("input[type='file']", state="attached", timeout=25000)
 
-        # 1. Localización estricta de campos de archivo
+        # 1. Asignar archivos
         file_inputs = await page.locator("input[type='file']").all()
         if len(file_inputs) >= 2:
             await file_inputs[0].set_input_files(cer_path)
@@ -237,11 +235,11 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
         await pwd_input.press("Tab")
         await page.wait_for_timeout(1000)
 
-        # 4. Monitorear campos generados por el JavaScript del SAT
+        # 4. Validar que el token de firma se haya generado ANTES de pulsar Enviar
         logger.info("Esperando que el script del SAT procese la firma del reto...")
-        token_listo = False
+        token_firmado = False
         try:
-            token_listo = await page.wait_for_function(
+            token_firmado = await page.wait_for_function(
                 """() => {
                     const candidates = document.querySelectorAll("input[type='hidden'], input");
                     for (const el of candidates) {
@@ -252,12 +250,12 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                     }
                     return false;
                 }""",
-                timeout=20000
+                timeout=25000
             )
         except Exception:
             pass
 
-        if not token_listo:
+        if not token_firmado:
             dump_inputs = await page.evaluate("""() => {
                 return [...document.querySelectorAll('input')].map(e => ({
                     id: e.id || '',
@@ -267,9 +265,13 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                     onclick: e.getAttribute('onclick') || ''
                 }));
             }""")
-            logger.warning(f"Volcado de inputs en formsloginFEA: {json.dumps(dump_inputs)}")
+            logger.error(f"Firma no detectada. Volcado de inputs: {json.dumps(dump_inputs)}")
+            raise Exception(
+                f"El JavaScript del SAT no generó el token firmado antes de enviar. "
+                f"Estado de inputs: {dump_inputs}"
+            )
 
-        # 5. Localizar y pulsar el botón visible y habilitado recorriendo todos los frames
+        # 5. Localizar y pulsar el botón visible y habilitado
         selectores = [
             "input[type='submit']",
             "input[type='image']",
@@ -288,7 +290,7 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                 for i in range(total):
                     boton = elementos.nth(i)
                     if await boton.is_visible() and await boton.is_enabled():
-                        logger.info(f"Botón de envío encontrado en frame con selector: {selector}")
+                        logger.info(f"Botón de envío accionado con selector: {selector}")
                         await boton.click()
                         enviado = True
                         break
@@ -307,7 +309,6 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                     name: el.name,
                     type: el.type,
                     value: el.value,
-                    text: el.innerText,
                     visible: !!(el.offsetWidth || el.offsetHeight),
                     disabled: el.disabled
                 }))
@@ -331,9 +332,8 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                 });
                 return textNodes.join(' | ');
             }""")
-            if mensajes_error:
-                raise Exception(f"El SAT reportó: {mensajes_error}")
-            raise Exception(f"El portal del SAT no avanzó tras el envío (permanece en {page.url}).")
+            html_snippet = await page.evaluate("() => document.body.innerText.substring(0, 300)")
+            raise Exception(f"El portal no avanzó tras el envío. Mensajes: '{mensajes_error}'. Texto en página: '{html_snippet.strip()}'. URL: {page.url}")
 
         await page.wait_for_load_state("networkidle", timeout=30000)
 
@@ -530,12 +530,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.13.0"
+        "version": "6.14.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.13.0"}
+    return {"status": "healthy", "version": "6.14.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
