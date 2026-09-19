@@ -30,7 +30,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D",
-    version="6.0.0"
+    version="6.1.0"
 )
 
 app.add_middleware(
@@ -40,6 +40,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+CHROME_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled"
+]
 
 # ---------------------------------------------------------------------------
 # Utilidades Criptográficas y CFDIClient
@@ -172,15 +180,12 @@ def extraer_xmls(paquete_data) -> list:
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str):
     """Realiza el login interactivo por e.firma en el SSO del SAT."""
     try:
-        # Selector de pestaña e.firma si el portal muestra CIEC por defecto
         btn_efirma = page.locator("#buttonFiel, a[href*='fiel'], button:has-text('e.firma')").first
-        if await btn_efirma.is_visible(timeout=3000):
+        if await btn_efirma.is_visible(timeout=4000):
             await btn_efirma.click()
 
-        # Esperar inputs de archivos
-        await page.wait_for_selector("input[type='file']", timeout=15000)
+        await page.wait_for_selector("input[type='file']", timeout=20000)
         
-        # Localización de campos de subida de archivos
         file_inputs = await page.locator("input[type='file']").all()
         if len(file_inputs) >= 2:
             await file_inputs[0].set_input_files(cer_path)
@@ -189,13 +194,11 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
             await page.set_input_files("input#fileCertificate, input[name*='cert']", cer_path)
             await page.set_input_files("input#filePrivateKey, input[name*='key']", key_path)
 
-        # Contraseña de la clave privada
         await page.fill("input#privateKeyPassword, input#txtPassword, input[type='password']", password)
 
-        # Enviar formulario
         btn_submit = page.locator("input#submit, button#submit, input[type='submit'], button:has-text('Enviar')").first
         await btn_submit.click()
-        await page.wait_for_load_state("networkidle", timeout=25000)
+        await page.wait_for_load_state("networkidle", timeout=30000)
     except Exception as e:
         logger.error(f"Falla durante la autenticación e.firma: {e}")
         raise HTTPException(status_code=401, detail=f"No se pudo completar el acceso con e.firma al SAT: {str(e)}")
@@ -210,7 +213,7 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright",
-        "version": "6.0.0"
+        "version": "6.1.0"
     }
 
 @app.post("/api/sat/solicitar")
@@ -367,7 +370,7 @@ async def descargar_paquete(
         raise HTTPException(status_code=502, detail=f"Error al descargar del SAT: {str(e)}")
 
 # ---------------------------------------------------------------------------
-# Nuevos Módulos: Opinión 32-D y Constancia de Situación Fiscal (CSF)
+# Módulos: Opinión 32-D y Constancia de Situación Fiscal (CSF)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/sat/sync-opinion")
@@ -391,23 +394,26 @@ async def obtener_opinion_cumplimiento(
             f_key.write(key_bytes)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(accept_downloads=True)
+            browser = await p.chromium.launch(headless=True, args=CHROME_ARGS)
+            context = await browser.new_context(
+                accept_downloads=True,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
             page = await context.new_page()
 
             try:
-                # 1. Acceso a la URL oficial del trámite 32-D
-                url_opinion = "https://ptscdecypag.sat.gob.mx/OpinionCumplimiento/"
-                await page.goto(url_opinion, timeout=60000)
+                # URL oficial de acceso a Opinión de Cumplimiento
+                url_opinion = "https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/"
+                await page.goto(url_opinion, wait_until="domcontentloaded", timeout=60000)
 
-                # Si redirige al login del SAT
-                if "login" in page.url.lower() or "nidp" in page.url.lower():
+                # Si pide autenticación por e.firma
+                if "login" in page.url.lower() or "nidp" in page.url.lower() or "acceso" in page.url.lower():
                     await autenticar_portal_sat(page, cer_path, key_path, password)
 
-                # 2. Esperar generación y descarga del PDF
-                async with page.expect_download(timeout=45000) as download_info:
-                    # El portal puede descargar automáticamente o requerir clic
-                    btn_descarga = page.locator("button:has-text('Descargar'), a:has-text('Guardar')").first
+                await page.wait_for_load_state("networkidle", timeout=45000)
+
+                async with page.expect_download(timeout=60000) as download_info:
+                    btn_descarga = page.locator("a[id*='descargar'], button[id*='descargar'], input[value*='Descargar'], a:has-text('Descargar'), button:has-text('Descargar')").first
                     if await btn_descarga.is_visible():
                         await btn_descarga.click()
 
@@ -415,7 +421,6 @@ async def obtener_opinion_cumplimiento(
                 pdf_path = os.path.join(temp_dir, "opinion_32d.pdf")
                 await download.save_as(pdf_path)
 
-                # 3. Lectura de contenido y extracción del veredicto
                 with open(pdf_path, "rb") as pdf_file:
                     pdf_bytes = pdf_file.read()
 
@@ -468,39 +473,48 @@ async def obtener_csf(
             f_key.write(key_bytes)
 
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(accept_downloads=True)
+            browser = await p.chromium.launch(headless=True, args=CHROME_ARGS)
+            context = await browser.new_context(
+                accept_downloads=True,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
             page = await context.new_page()
 
             try:
-                # 1. URL de reexpedición de CIF / CSF
-                url_cif = "https://www.sat.gob.mx/aplicacion/operacion/43824/reimprime-tus-acuses-del-rfc"
-                await page.goto(url_cif, timeout=60000)
+                # URL de reimpresión de acuses / CIF
+                url_cif = "https://ptscdecypag.sat.gob.mx/ReimpresionAcuses/"
+                await page.goto(url_cif, wait_until="domcontentloaded", timeout=60000)
 
-                if "login" in page.url.lower() or "nidp" in page.url.lower():
+                if "login" in page.url.lower() or "nidp" in page.url.lower() or "acceso" in page.url.lower():
                     await autenticar_portal_sat(page, cer_path, key_path, password)
 
-                # 2. Clic en botón "Generar Constancia"
-                btn_generar = page.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia']").first
-                await btn_generar.wait_for(state="visible", timeout=30000)
+                await page.wait_for_load_state("networkidle", timeout=30000)
 
-                async with page.expect_popup() as popup_info:
+                # Localizar el botón 'Generar Constancia' en página o frames
+                btn_generar = page.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia'], a:has-text('Generar Constancia')").first
+
+                if not await btn_generar.is_visible():
+                    for frame in page.frames:
+                        frame_btn = frame.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia']").first
+                        if await frame_btn.is_visible():
+                            btn_generar = frame_btn
+                            break
+
+                await btn_generar.wait_for(state="visible", timeout=45000)
+
+                async with page.expect_download(timeout=45000) as download_info:
                     await btn_generar.click()
-                
-                popup = await popup_info.value
-                await popup.wait_for_load_state("networkidle")
 
-                # 3. Guardar el PDF generado por la ventana emergente
-                pdf_bytes = await popup.pdf() if hasattr(popup, "pdf") else None
-                if not pdf_bytes:
-                    # Captura mediante stream si la ventana responde como archivo directo
-                    pdf_bytes = await popup.body()
+                download = await download_info.value
+                pdf_path = os.path.join(temp_dir, "csf.pdf")
+                await download.save_as(pdf_path)
 
-                # 4. Extraer texto para actualizar perfil en base de datos
+                with open(pdf_path, "rb") as f_pdf:
+                    pdf_bytes = f_pdf.read()
+
                 reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
                 texto = "".join([pg.extract_text() or "" for pg in reader.pages])
 
-                # Búsqueda por expresiones regulares básicas en el layout de la CSF
                 cp_match = re.search(r"Código Postal:?\s*(\d{5})", texto, re.IGNORECASE)
                 codigo_postal = cp_match.group(1) if cp_match else ""
 
