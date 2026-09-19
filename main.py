@@ -10,6 +10,7 @@ import io
 import re
 import uuid
 import logging
+import time
 import asyncio
 
 import pypdf
@@ -33,8 +34,8 @@ logger = logging.getLogger("sat_service")
 
 app = FastAPI(
     title="Microservicio SAT Integral",
-    description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (HTTP Nativo)",
-    version="7.0.0"
+    description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (HTTP Nativo con Retry)",
+    version="7.1.0"
 )
 
 app.add_middleware(
@@ -172,7 +173,7 @@ def extraer_xmls(paquete_data) -> list:
     return xmls
 
 # ---------------------------------------------------------------------------
-# Workers en Segundo Plano (HTTP Criptográfico con satcfdi)
+# Workers en Segundo Plano (satcfdi con reintentos para 32-D)
 # ---------------------------------------------------------------------------
 
 def _generar_csf_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
@@ -183,7 +184,6 @@ def _generar_csf_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> byte
 async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "csf", "created_at": datetime.now().isoformat()}
     try:
-        # Ejecuta la llamada síncrona en un threadpool para no bloquear el bucle de eventos
         pdf_bytes = await asyncio.to_thread(_generar_csf_sync, cer_bytes, key_bytes, password)
 
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
@@ -210,9 +210,25 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
         }
 
 def _generar_opinion_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
+    """Intenta descargar la Opinión 32-D aplicando reintentos si el SAT devuelve 400 por tiempo de compilación."""
     signer = Signer.load(certificate=cer_bytes, key=key_bytes, password=password)
     op = SATPortalOpinionCumplimiento(signer)
-    return op.generar_opinion_cumplimiento()
+    
+    ultimo_error = None
+    for intento in range(1, 4):
+        try:
+            logger.info(f"Solicitando Opinión 32-D (Intento {intento}/3)...")
+            return op.generar_opinion_cumplimiento()
+        except Exception as e:
+            ultimo_error = e
+            error_str = str(e)
+            logger.warning(f"Intento {intento} falló para Opinión 32-D: {error_str}")
+            if "400" in error_str or "ObtenerPdf" in error_str:
+                # El SAT necesita un momento para terminar de armar el reporte antes de dar el PDF
+                time.sleep(4)
+            else:
+                raise e
+    raise ultimo_error
 
 async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "opinion", "created_at": datetime.now().isoformat()}
@@ -258,16 +274,15 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + satcfdi HTTP crypto",
-        "version": "7.0.0"
+        "version": "7.1.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "7.0.0"}
+    return {"status": "healthy", "version": "7.1.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
-    """Consulta periódica para saber si la CSF o 32-D están listas."""
     if task_id not in TASKS:
         raise HTTPException(status_code=404, detail="Tarea no encontrada o expirada.")
     return TASKS[task_id]
