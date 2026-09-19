@@ -7,17 +7,14 @@ from cryptography.hazmat.primitives import serialization
 import base64
 import zipfile
 import io
-import os
 import re
-import tempfile
 import uuid
 import logging
-import json
 import asyncio
 
-from playwright.async_api import async_playwright
 import pypdf
 
+# Librería para descarga masiva de CFDI (SOAP oficial)
 from cfdiclient import (
     Fiel,
     Autenticacion,
@@ -27,13 +24,17 @@ from cfdiclient import (
     DescargaMasiva
 )
 
+# Librería para autenticación criptográfica directa por HTTP (CSF y Opinión 32-D)
+from satcfdi.models import Signer
+from satcfdi.portal import SATPortalConstancia, SATPortalOpinionCumplimiento
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sat_service")
 
 app = FastAPI(
     title="Microservicio SAT Integral",
-    description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.16.0"
+    description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (HTTP Nativo)",
+    version="7.0.0"
 )
 
 app.add_middleware(
@@ -43,14 +44,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-CHROME_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-blink-features=AutomationControlled"
-]
 
 TASKS: Dict[str, Dict[str, Any]] = {}
 
@@ -179,299 +172,81 @@ def extraer_xmls(paquete_data) -> list:
     return xmls
 
 # ---------------------------------------------------------------------------
-# Automatización Portal SAT (Playwright con file chooser y disparo de scripts)
+# Workers en Segundo Plano (HTTP Criptográfico con satcfdi)
 # ---------------------------------------------------------------------------
 
-async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str, rfc: str = ""):
-    """Realiza el login en formsloginFEA.asp emulando la selección por file chooser."""
-    try:
-        btn_efirma = page.locator("#buttonFiel, a#btnFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
-        if await btn_efirma.is_visible(timeout=3000):
-            await btn_efirma.click()
-
-        try:
-            loading_msg = page.locator("text='Descargando las herramientas'")
-            if await loading_msg.is_visible(timeout=2000):
-                await loading_msg.wait_for(state="hidden", timeout=25000)
-        except Exception:
-            pass
-
-        # 1. Cargar Certificado vía botón SeleccionaArchivo (#btnCertificado)
-        logger.info("Cargando certificado .cer vía FileChooser...")
-        if await page.locator("#btnCertificado").count() > 0:
-            async with page.expect_file_chooser() as fc_cer:
-                await page.locator("#btnCertificado").click()
-            file_chooser = await fc_cer.value
-            await file_chooser.set_files(cer_path)
-        else:
-            await page.locator("#cert").set_input_files(cer_path)
-            await page.locator("#cert").dispatch_event("change")
-
-        # Esperar a que el SAT procese el certificado y popule #txtCertificado y #sRFC
-        logger.info("Esperando que el script del SAT complete #txtCertificado y #sRFC...")
-        try:
-            await page.wait_for_function(
-                """() => {
-                    const txtC = document.querySelector('#txtCertificado')?.value || '';
-                    const rfc = document.querySelector('#sRFC')?.value || '';
-                    return (txtC.length > 0) && (rfc.trim().length >= 10);
-                }""",
-                timeout=20000
-            )
-            s_rfc_val = await page.evaluate("() => document.querySelector('#sRFC')?.value || ''")
-            logger.info(f"Certificado validado en el formulario con sRFC: {s_rfc_val}")
-        except Exception:
-            logger.warning("Timeout esperando #sRFC; forzando eventos en #cert...")
-            await page.locator("#cert").dispatch_event("change")
-            await page.locator("#cert").dispatch_event("blur")
-            await page.wait_for_timeout(1000)
-
-        # 2. Cargar Llave Privada vía botón SeleccionaArchivo (#btnLlavePrivada)
-        logger.info("Cargando llave privada .key vía FileChooser...")
-        if await page.locator("#btnLlavePrivada").count() > 0:
-            async with page.expect_file_chooser() as fc_key:
-                await page.locator("#btnLlavePrivada").click()
-            file_chooser_key = await fc_key.value
-            await file_chooser_key.set_files(key_path)
-        else:
-            await page.locator("#key").set_input_files(key_path)
-            await page.locator("#key").dispatch_event("change")
-
-        # Esperar a que el SAT popule #txtLlavePrivada
-        try:
-            await page.wait_for_function(
-                """() => (document.querySelector('#txtLlavePrivada')?.value || '').length > 0""",
-                timeout=12000
-            )
-            logger.info("Llave privada validada en el formulario (#txtLlavePrivada poblado).")
-        except Exception:
-            logger.warning("Timeout esperando #txtLlavePrivada; forzando change en #key...")
-            await page.locator("#key").dispatch_event("change")
-            await page.wait_for_timeout(1000)
-
-        # 3. Contraseña de la clave privada
-        pwd_input = page.locator("#Password, input[type='password']").first
-        await pwd_input.fill(password)
-        await pwd_input.press("Tab")
-        await page.wait_for_timeout(800)
-
-        # 4. Clic en #submit1 (ejecuta Validate() en el portal)
-        logger.info("Pulsando #submit1 (Validate())...")
-        await page.locator("#submit1").click()
-
-        # 5. Esperar a que se genere #Firma o redirija fuera de formsloginFEA
-        logger.info("Esperando que el SAT firme el formulario y redirija...")
-        try:
-            await page.wait_for_function(
-                """() => {
-                    const f = document.querySelector('#Firma')?.value || '';
-                    const url = location.href.toLowerCase();
-                    return (f.trim().length > 1) || (!url.includes('formsloginfea'));
-                }""",
-                timeout=35000
-            )
-        except Exception:
-            mensajes_error = await page.evaluate("""() => {
-                const textNodes = [];
-                const els = document.querySelectorAll('.msg-error, #error, #lblError, font[color="red"], span[style*="red"], div[class*="error"], td.error, #divError, .alert-danger');
-                els.forEach(el => {
-                    if (el.innerText && el.innerText.trim().length > 0) {
-                        textNodes.push(el.innerText.trim());
-                    }
-                });
-                return textNodes.join(' | ');
-            }""")
-            raise Exception(f"El portal del SAT no avanzó tras el envío. Mensajes: '{mensajes_error}'. URL actual: {page.url}")
-
-        # 6. Salida de la pantalla de login
-        await page.wait_for_url(
-            lambda url: "formslogin" not in url.lower() and "nidp" not in url.lower() and "login" not in url.lower(),
-            timeout=30000
-        )
-        await page.wait_for_load_state("networkidle", timeout=30000)
-
-    except Exception as e:
-        logger.error(f"Falla durante la autenticación e.firma: {e}")
-        raise Exception(f"No se pudo completar el acceso con e.firma al SAT: {str(e)}")
-
-# ---------------------------------------------------------------------------
-# Workers en Segundo Plano
-# ---------------------------------------------------------------------------
+def _generar_csf_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
+    signer = Signer.load(certificate=cer_bytes, key=key_bytes, password=password)
+    sp = SATPortalConstancia(signer)
+    return sp.generar_constancia()
 
 async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "csf", "created_at": datetime.now().isoformat()}
-    screenshot_b64 = None
+    try:
+        # Ejecuta la llamada síncrona en un threadpool para no bloquear el bucle de eventos
+        pdf_bytes = await asyncio.to_thread(_generar_csf_sync, cer_bytes, key_bytes, password)
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        cer_path = os.path.join(temp_dir, "fiel.cer")
-        key_path = os.path.join(temp_dir, "fiel.key")
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        texto = "".join([pg.extract_text() or "" for pg in reader.pages])
 
-        with open(cer_path, "wb") as f_cer, open(key_path, "wb") as f_key:
-            f_cer.write(cer_bytes)
-            f_key.write(key_bytes)
+        cp_match = re.search(r"Código Postal:?\s*(\d{5})", texto, re.IGNORECASE)
+        codigo_postal = cp_match.group(1) if cp_match else ""
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=CHROME_ARGS)
-            context = await browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                accept_downloads=True,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
-            page = await context.new_page()
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
-            try:
-                url_cif = "https://www.acuse.sat.gob.mx/ReimpresionInternet/REIMDefault.htm"
-                await page.goto(url_cif, wait_until="domcontentloaded", timeout=70000)
+        TASKS[task_id] = {
+            "status": "completed",
+            "rfc": rfc,
+            "codigo_postal": codigo_postal,
+            "pdf_base64": pdf_b64,
+            "fecha_emision": datetime.now().isoformat()
+        }
+        logger.info(f"CSF descargada con éxito para {rfc} en segundo plano.")
+    except Exception as e:
+        logger.error(f"Error generando CSF para {rfc}: {e}")
+        TASKS[task_id] = {
+            "status": "failed",
+            "error": f"Falla en el portal del SAT: {str(e)}"
+        }
 
-                if any(x in page.url.lower() for x in ["login", "nidp", "acceso", "formslogin"]):
-                    await autenticar_portal_sat(page, cer_path, key_path, password, rfc=rfc)
-
-                await page.wait_for_load_state("networkidle", timeout=35000)
-
-                try:
-                    btn_cerrar = page.locator("button:has-text('Aceptar'), button:has-text('Continuar'), button:has-text('Cerrar'), .ui-dialog-titlebar-close, a:has-text('Continuar')").first
-                    if await btn_cerrar.is_visible(timeout=3000):
-                        await btn_cerrar.click()
-                        await page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-
-                selector_boton = "input#Generar, input[value*='Generar Constancia'], button:has-text('Generar Constancia'), a:has-text('Generar Constancia')"
-                target_element = None
-
-                if await page.locator(selector_boton).count() > 0:
-                    target_element = page.locator(selector_boton).first
-                else:
-                    for frame in page.frames:
-                        if await frame.locator(selector_boton).count() > 0:
-                            target_element = frame.locator(selector_boton).first
-                            break
-
-                if not target_element:
-                    screenshot_bytes = await page.screenshot(full_page=True)
-                    screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
-                    raise Exception(f"No se localizó el botón 'Generar Constancia'. URL actual: {page.url}")
-
-                async with page.expect_download(timeout=50000) as download_info:
-                    await target_element.click()
-
-                download = await download_info.value
-                pdf_path = os.path.join(temp_dir, "csf.pdf")
-                await download.save_as(pdf_path)
-
-                with open(pdf_path, "rb") as f_pdf:
-                    pdf_bytes = f_pdf.read()
-
-                reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-                texto = "".join([pg.extract_text() or "" for pg in reader.pages])
-
-                cp_match = re.search(r"Código Postal:?\s*(\d{5})", texto, re.IGNORECASE)
-                codigo_postal = cp_match.group(1) if cp_match else ""
-
-                pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-
-                TASKS[task_id] = {
-                    "status": "completed",
-                    "rfc": rfc,
-                    "codigo_postal": codigo_postal,
-                    "pdf_base64": pdf_b64,
-                    "fecha_emision": datetime.now().isoformat()
-                }
-
-            except Exception as e:
-                logger.error(f"Falla en background CSF {task_id}: {e}")
-                if "page" in locals() and not screenshot_b64:
-                    try:
-                        s_bytes = await page.screenshot(full_page=True)
-                        screenshot_b64 = base64.b64encode(s_bytes).decode("utf-8")
-                    except Exception:
-                        pass
-                TASKS[task_id] = {
-                    "status": "failed",
-                    "error": str(e),
-                    "screenshot_b64": screenshot_b64
-                }
-            finally:
-                await browser.close()
+def _generar_opinion_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
+    signer = Signer.load(certificate=cer_bytes, key=key_bytes, password=password)
+    op = SATPortalOpinionCumplimiento(signer)
+    return op.generar_opinion_cumplimiento()
 
 async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "opinion", "created_at": datetime.now().isoformat()}
-    screenshot_b64 = None
+    try:
+        pdf_bytes = await asyncio.to_thread(_generar_opinion_sync, cer_bytes, key_bytes, password)
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        cer_path = os.path.join(temp_dir, "fiel.cer")
-        key_path = os.path.join(temp_dir, "fiel.key")
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        texto_completo = "".join([pg.extract_text() or "" for pg in reader.pages]).upper()
 
-        with open(cer_path, "wb") as f_cer, open(key_path, "wb") as f_key:
-            f_cer.write(cer_bytes)
-            f_key.write(key_bytes)
+        if "POSITIVO" in texto_completo:
+            opinion_status = "POSITIVA"
+        elif "NEGATIVO" in texto_completo:
+            opinion_status = "NEGATIVA"
+        elif "NO INSCRITO" in texto_completo or "SIN OBLIGACIONES" in texto_completo:
+            opinion_status = "SIN_OPINION"
+        else:
+            opinion_status = "REVISION"
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=CHROME_ARGS)
-            context = await browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                accept_downloads=True,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
-            page = await context.new_page()
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
-            try:
-                url_opinion = "https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/"
-                await page.goto(url_opinion, wait_until="domcontentloaded", timeout=70000)
-
-                if any(x in page.url.lower() for x in ["login", "nidp", "acceso"]):
-                    await autenticar_portal_sat(page, cer_path, key_path, password, rfc=rfc)
-
-                await page.wait_for_load_state("networkidle", timeout=45000)
-
-                async with page.expect_download(timeout=60000) as download_info:
-                    btn_descarga = page.locator("a[id*='descargar'], button[id*='descargar'], input[value*='Descargar'], a:has-text('Descargar'), button:has-text('Descargar')").first
-                    if await btn_descarga.is_visible():
-                        await btn_descarga.click()
-
-                download = await download_info.value
-                pdf_path = os.path.join(temp_dir, "opinion_32d.pdf")
-                await download.save_as(pdf_path)
-
-                with open(pdf_path, "rb") as pdf_file:
-                    pdf_bytes = pdf_file.read()
-
-                reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-                texto_completo = "".join([pg.extract_text() or "" for pg in reader.pages]).upper()
-
-                if "POSITIVO" in texto_completo:
-                    opinion_status = "POSITIVA"
-                elif "NEGATIVO" in texto_completo:
-                    opinion_status = "NEGATIVA"
-                elif "NO INSCRITO" in texto_completo or "SIN OBLIGACIONES" in texto_completo:
-                    opinion_status = "SIN_OPINION"
-                else:
-                    opinion_status = "REVISION"
-
-                pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-
-                TASKS[task_id] = {
-                    "status": "completed",
-                    "rfc": rfc,
-                    "opinion_status": opinion_status,
-                    "pdf_base64": pdf_b64,
-                    "fecha_consulta": datetime.now().isoformat()
-                }
-            except Exception as e:
-                logger.error(f"Falla en background 32-D {task_id}: {e}")
-                if "page" in locals() and not screenshot_b64:
-                    try:
-                        s_bytes = await page.screenshot(full_page=True)
-                        screenshot_b64 = base64.b64encode(s_bytes).decode("utf-8")
-                    except Exception:
-                        pass
-                TASKS[task_id] = {
-                    "status": "failed",
-                    "error": str(e),
-                    "screenshot_b64": screenshot_b64
-                }
-            finally:
-                await browser.close()
+        TASKS[task_id] = {
+            "status": "completed",
+            "rfc": rfc,
+            "opinion_status": opinion_status,
+            "pdf_base64": pdf_b64,
+            "fecha_consulta": datetime.now().isoformat()
+        }
+        logger.info(f"Opinión 32-D generada con éxito ({opinion_status}) para {rfc}.")
+    except Exception as e:
+        logger.error(f"Error generando Opinión 32-D para {rfc}: {e}")
+        TASKS[task_id] = {
+            "status": "failed",
+            "error": f"Falla en el portal del SAT: {str(e)}"
+        }
 
 # ---------------------------------------------------------------------------
 # Endpoints de Salud y Polling
@@ -482,13 +257,13 @@ def ruta_raiz():
     return {
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
-        "motor": "cfdiclient + playwright async",
-        "version": "6.16.0"
+        "motor": "cfdiclient + satcfdi HTTP crypto",
+        "version": "7.0.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.16.0"}
+    return {"status": "healthy", "version": "7.0.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
