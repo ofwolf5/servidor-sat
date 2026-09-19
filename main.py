@@ -32,7 +32,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.4.0"
+    version="6.5.0"
 )
 
 app.add_middleware(
@@ -216,6 +216,8 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
 
 async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "csf", "created_at": datetime.now().isoformat()}
+    screenshot_b64 = None
+
     with tempfile.TemporaryDirectory() as temp_dir:
         cer_path = os.path.join(temp_dir, "fiel.cer")
         key_path = os.path.join(temp_dir, "fiel.key")
@@ -227,6 +229,7 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=CHROME_ARGS)
             context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
                 accept_downloads=True,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             )
@@ -236,23 +239,38 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
                 url_cif = "https://www.acuse.sat.gob.mx/ReimpresionInternet/REIMDefault.htm"
                 await page.goto(url_cif, wait_until="domcontentloaded", timeout=70000)
 
-                if "login" in page.url.lower() or "nidp" in page.url.lower() or "acceso" in page.url.lower() or "formslogin" in page.url.lower():
+                if any(x in page.url.lower() for x in ["login", "nidp", "acceso", "formslogin"]):
                     await autenticar_portal_sat(page, cer_path, key_path, password)
 
-                await page.wait_for_load_state("networkidle", timeout=45000)
+                await page.wait_for_load_state("networkidle", timeout=35000)
 
-                btn_generar = page.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia'], a:has-text('Generar Constancia')").first
-                if not await btn_generar.is_visible():
+                # Descartar avisos o modales emergentes
+                try:
+                    btn_cerrar = page.locator("button:has-text('Aceptar'), button:has-text('Continuar'), button:has-text('Cerrar'), .ui-dialog-titlebar-close, a:has-text('Continuar')").first
+                    if await btn_cerrar.is_visible(timeout=3000):
+                        await btn_cerrar.click()
+                        await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+                selector_boton = "input#Generar, input[value*='Generar Constancia'], button:has-text('Generar Constancia'), a:has-text('Generar Constancia')"
+                target_element = None
+
+                if await page.locator(selector_boton).count() > 0:
+                    target_element = page.locator(selector_boton).first
+                else:
                     for frame in page.frames:
-                        frame_btn = frame.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia'], a:has-text('Generar Constancia')").first
-                        if await frame_btn.is_visible():
-                            btn_generar = frame_btn
+                        if await frame.locator(selector_boton).count() > 0:
+                            target_element = frame.locator(selector_boton).first
                             break
 
-                await btn_generar.wait_for(state="visible", timeout=60000)
+                if not target_element:
+                    screenshot_bytes = await page.screenshot(full_page=True)
+                    screenshot_b64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+                    raise Exception(f"No se localizó el botón 'Generar Constancia'. URL actual: {page.url}")
 
-                async with page.expect_download(timeout=60000) as download_info:
-                    await btn_generar.click()
+                async with page.expect_download(timeout=50000) as download_info:
+                    await target_element.click()
 
                 download = await download_info.value
                 pdf_path = os.path.join(temp_dir, "csf.pdf")
@@ -276,14 +294,21 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
                     "pdf_base64": pdf_b64,
                     "fecha_emision": datetime.now().isoformat()
                 }
+
             except Exception as e:
                 logger.error(f"Falla en background CSF {task_id}: {e}")
-                TASKS[task_id] = {"status": "failed", "error": str(e)}
+                TASKS[task_id] = {
+                    "status": "failed",
+                    "error": str(e),
+                    "screenshot_b64": screenshot_b64
+                }
             finally:
                 await browser.close()
 
 async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "opinion", "created_at": datetime.now().isoformat()}
+    screenshot_b64 = None
+
     with tempfile.TemporaryDirectory() as temp_dir:
         cer_path = os.path.join(temp_dir, "fiel.cer")
         key_path = os.path.join(temp_dir, "fiel.key")
@@ -295,6 +320,7 @@ async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: byt
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True, args=CHROME_ARGS)
             context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
                 accept_downloads=True,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             )
@@ -304,7 +330,7 @@ async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: byt
                 url_opinion = "https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/"
                 await page.goto(url_opinion, wait_until="domcontentloaded", timeout=70000)
 
-                if "login" in page.url.lower() or "nidp" in page.url.lower() or "acceso" in page.url.lower():
+                if any(x in page.url.lower() for x in ["login", "nidp", "acceso"]):
                     await autenticar_portal_sat(page, cer_path, key_path, password)
 
                 await page.wait_for_load_state("networkidle", timeout=45000)
@@ -344,7 +370,17 @@ async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: byt
                 }
             except Exception as e:
                 logger.error(f"Falla en background 32-D {task_id}: {e}")
-                TASKS[task_id] = {"status": "failed", "error": str(e)}
+                if "page" in locals():
+                    try:
+                        s_bytes = await page.screenshot(full_page=True)
+                        screenshot_b64 = base64.b64encode(s_bytes).decode("utf-8")
+                    except Exception:
+                        pass
+                TASKS[task_id] = {
+                    "status": "failed",
+                    "error": str(e),
+                    "screenshot_b64": screenshot_b64
+                }
             finally:
                 await browser.close()
 
@@ -358,16 +394,16 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.4.0"
+        "version": "6.5.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.4.0"}
+    return {"status": "healthy", "version": "6.5.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
-    """Permite al frontend consultar periódicamente si el PDF ya está listo."""
+    """Consulta periódica para saber si la CSF o 32-D están listas."""
     if task_id not in TASKS:
         raise HTTPException(status_code=404, detail="Tarea no encontrada o expirada.")
     return TASKS[task_id]
