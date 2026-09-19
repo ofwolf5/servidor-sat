@@ -30,7 +30,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D",
-    version="6.1.0"
+    version="6.2.0"
 )
 
 app.add_middleware(
@@ -180,7 +180,8 @@ def extraer_xmls(paquete_data) -> list:
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str):
     """Realiza el login interactivo por e.firma en el SSO del SAT."""
     try:
-        btn_efirma = page.locator("#buttonFiel, a[href*='fiel'], button:has-text('e.firma')").first
+        # Pestaña e.firma
+        btn_efirma = page.locator("#buttonFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
         if await btn_efirma.is_visible(timeout=4000):
             await btn_efirma.click()
 
@@ -204,7 +205,7 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
         raise HTTPException(status_code=401, detail=f"No se pudo completar el acceso con e.firma al SAT: {str(e)}")
 
 # ---------------------------------------------------------------------------
-# Endpoints Base y CFDI Descarga Masiva
+# Endpoints de Salud y Estado
 # ---------------------------------------------------------------------------
 
 @app.get("/")
@@ -213,8 +214,16 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright",
-        "version": "6.1.0"
+        "version": "6.2.0"
     }
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "version": "6.2.0"}
+
+# ---------------------------------------------------------------------------
+# CFDI Descarga Masiva
+# ---------------------------------------------------------------------------
 
 @app.post("/api/sat/solicitar")
 async def solicitar_descarga(
@@ -481,11 +490,11 @@ async def obtener_csf(
             page = await context.new_page()
 
             try:
-                # URL de reimpresión de acuses / CIF
-                url_cif = "https://ptscdecypag.sat.gob.mx/ReimpresionAcuses/"
+                # URL oficial y pública de reimpresión de acuses del RFC y CSF
+                url_cif = "https://www.acuse.sat.gob.mx/ReimpresionInternet/REIMDefault.htm"
                 await page.goto(url_cif, wait_until="domcontentloaded", timeout=60000)
 
-                if "login" in page.url.lower() or "nidp" in page.url.lower() or "acceso" in page.url.lower():
+                if "login" in page.url.lower() or "nidp" in page.url.lower() or "acceso" in page.url.lower() or "formslogin" in page.url.lower():
                     await autenticar_portal_sat(page, cer_path, key_path, password)
 
                 await page.wait_for_load_state("networkidle", timeout=30000)
@@ -495,7 +504,7 @@ async def obtener_csf(
 
                 if not await btn_generar.is_visible():
                     for frame in page.frames:
-                        frame_btn = frame.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia']").first
+                        frame_btn = frame.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia'], a:has-text('Generar Constancia')").first
                         if await frame_btn.is_visible():
                             btn_generar = frame_btn
                             break
