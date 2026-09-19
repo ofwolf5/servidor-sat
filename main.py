@@ -14,6 +14,8 @@ import time
 import asyncio
 
 import pypdf
+import requests
+from bs4 import BeautifulSoup
 
 # Librería para descarga masiva de CFDI (SOAP oficial)
 from cfdiclient import (
@@ -25,7 +27,7 @@ from cfdiclient import (
     DescargaMasiva
 )
 
-# Librería para autenticación criptográfica directa por HTTP (CSF y Opinión 32-D)
+# Librería para autenticación criptográfica directa por HTTP
 from satcfdi.models import Signer
 from satcfdi.portal import SATPortalConstancia, SATPortalOpinionCumplimiento
 
@@ -34,8 +36,8 @@ logger = logging.getLogger("sat_service")
 
 app = FastAPI(
     title="Microservicio SAT Integral",
-    description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (HTTP Nativo con Retry)",
-    version="7.1.0"
+    description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (HTTP Nativo)",
+    version="7.2.0"
 )
 
 app.add_middleware(
@@ -173,7 +175,7 @@ def extraer_xmls(paquete_data) -> list:
     return xmls
 
 # ---------------------------------------------------------------------------
-# Workers en Segundo Plano (satcfdi con reintentos para 32-D)
+# Workers en Segundo Plano (satcfdi con manejo robusto para 32-D)
 # ---------------------------------------------------------------------------
 
 def _generar_csf_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
@@ -210,25 +212,53 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
         }
 
 def _generar_opinion_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
-    """Intenta descargar la Opinión 32-D aplicando reintentos si el SAT devuelve 400 por tiempo de compilación."""
+    """Descarga la Opinión 32-D con manejo de fallback directo por sesión HTTP autenticada."""
     signer = Signer.load(certificate=cer_bytes, key=key_bytes, password=password)
-    op = SATPortalOpinionCumplimiento(signer)
     
-    ultimo_error = None
-    for intento in range(1, 4):
-        try:
-            logger.info(f"Solicitando Opinión 32-D (Intento {intento}/3)...")
-            return op.generar_opinion_cumplimiento()
-        except Exception as e:
-            ultimo_error = e
-            error_str = str(e)
-            logger.warning(f"Intento {intento} falló para Opinión 32-D: {error_str}")
-            if "400" in error_str or "ObtenerPdf" in error_str:
-                # El SAT necesita un momento para terminar de armar el reporte antes de dar el PDF
-                time.sleep(4)
-            else:
-                raise e
-    raise ultimo_error
+    # 1. Intentar con el método de satcfdi aplicando pausas de compilación
+    try:
+        op = SATPortalOpinionCumplimiento(signer)
+        time.sleep(2)
+        return op.generar_opinion_cumplimiento()
+    except Exception as e_first:
+        logger.warning(f"Método directo de SATPortalOpinionCumplimiento reportó: {e_first}. Intentando consulta manual con sesión autenticada...")
+
+    # 2. Fallback: Autenticar sesión en el portal y consultar el endpoint de PDF directamente
+    sp = SATPortalConstancia(signer)
+    # Reutilizamos la sesión ya validada del portal
+    session = sp
+
+    url_opinion_base = "https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/"
+    res_home = session.get(url_opinion_base, timeout=25)
+    
+    time.sleep(3) # Esperar a que el SAT genere el folio del día
+
+    # Intentar obtener el PDF directamente
+    url_pdf = "https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/ObtenerPdf"
+    res_pdf = session.get(url_pdf, timeout=30)
+
+    if res_pdf.status_code == 200 and res_pdf.content.startswith(b"%PDF"):
+        return res_pdf.content
+
+    # Si no regresó PDF directo, buscar enlaces o mensajes en la respuesta HTML
+    soup = BeautifulSoup(res_home.text, "html.parser")
+    pdf_link = None
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if href and ("pdf" in href.lower() or "descarga" in href.lower() or "obtener" in href.lower()):
+            pdf_link = href
+            break
+
+    if pdf_link:
+        if not pdf_link.startswith("http"):
+            pdf_link = f"https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/{pdf_link.lstrip('/')}"
+        res_link = session.get(pdf_link, timeout=30)
+        if res_link.status_code == 200 and res_link.content.startswith(b"%PDF"):
+            return res_link.content
+
+    # Si todo falla, capturar texto del portal para diagnóstico exacto
+    texto_error = soup.get_text(separator=" ", strip=True)[:300]
+    raise Exception(f"El SAT no devolvió el PDF de la Opinión (Status HTTP {res_pdf.status_code}). Mensaje en portal: '{texto_error}'")
 
 async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "opinion", "created_at": datetime.now().isoformat()}
@@ -274,12 +304,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + satcfdi HTTP crypto",
-        "version": "7.1.0"
+        "version": "7.2.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "7.1.0"}
+    return {"status": "healthy", "version": "7.2.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
