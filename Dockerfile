@@ -1,27 +1,30 @@
-# Imagen oficial con Python y dependencias nativas listas
 FROM python:3.11-slim
 
-# Instalar dependencias del sistema mínimas
+# Instalar dependencias del sistema necesarias para networking y rendering de PDFs (weasyprint/cairo/pango)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
-    gnupg \
     ca-certificates \
+    libpango-1.0-0 \
+    libharfbuzz0b \
+    libpangoft2-1.0-0 \
+    libpangocairo-1.0-0 \
+    libcairo2 \
+    libgdk-pixbuf-2.0-0 \
+    libffi-dev \
+    shared-mime-info \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copiar requerimientos e instalar paquetes de Python
+# Instalar dependencias de Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Instalar Chromium junto con todas las librerías del sistema Linux necesarias
-RUN playwright install --with-deps chromium
-
-# Copiar el código del servicio
+# Copiar el código de la aplicación
 COPY . .
 
-# Puerto expuesto por Render
+# Puerto expuesto
 EXPOSE 10000
 
-# Comando para iniciar la API
+# Comando de inicio con Uvicorn
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
