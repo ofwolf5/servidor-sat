@@ -33,7 +33,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.15.0"
+    version="6.16.0"
 )
 
 app.add_middleware(
@@ -179,11 +179,11 @@ def extraer_xmls(paquete_data) -> list:
     return xmls
 
 # ---------------------------------------------------------------------------
-# Automatización Portal SAT (Playwright con selectores exactos formsloginFEA)
+# Automatización Portal SAT (Playwright con file chooser y disparo de scripts)
 # ---------------------------------------------------------------------------
 
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str, rfc: str = ""):
-    """Realiza el login por e.firma en formsloginFEA.asp utilizando los controles validados."""
+    """Realiza el login en formsloginFEA.asp emulando la selección por file chooser."""
     try:
         btn_efirma = page.locator("#buttonFiel, a#btnFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
         if await btn_efirma.is_visible(timeout=3000):
@@ -196,55 +196,71 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
         except Exception:
             pass
 
-        await page.wait_for_selector("input#cert, input[type='file']", state="attached", timeout=25000)
+        # 1. Cargar Certificado vía botón SeleccionaArchivo (#btnCertificado)
+        logger.info("Cargando certificado .cer vía FileChooser...")
+        if await page.locator("#btnCertificado").count() > 0:
+            async with page.expect_file_chooser() as fc_cer:
+                await page.locator("#btnCertificado").click()
+            file_chooser = await fc_cer.value
+            await file_chooser.set_files(cer_path)
+        else:
+            await page.locator("#cert").set_input_files(cer_path)
+            await page.locator("#cert").dispatch_event("change")
 
-        # 1. Cargar Certificado (.cer) y disparar eventos
-        cert_input = page.locator("#cert")
-        await cert_input.set_input_files(cer_path)
-        await cert_input.dispatch_event("change")
-        await cert_input.dispatch_event("input")
-
-        # 2. Esperar que el JavaScript del SAT procese el .cer y extraiga el RFC en #sRFC
-        logger.info("Esperando que el script del SAT popule el campo #sRFC...")
+        # Esperar a que el SAT procese el certificado y popule #txtCertificado y #sRFC
+        logger.info("Esperando que el script del SAT complete #txtCertificado y #sRFC...")
         try:
             await page.wait_for_function(
                 """() => {
-                    const r = document.querySelector('#sRFC')?.value || '';
-                    return r.trim().length >= 10;
+                    const txtC = document.querySelector('#txtCertificado')?.value || '';
+                    const rfc = document.querySelector('#sRFC')?.value || '';
+                    return (txtC.length > 0) && (rfc.trim().length >= 10);
                 }""",
-                timeout=15000
+                timeout=20000
             )
-            s_rfc_detectado = await page.evaluate("() => document.querySelector('#sRFC')?.value || ''")
-            logger.info(f"Certificado validado por el SAT con RFC: {s_rfc_detectado}")
+            s_rfc_val = await page.evaluate("() => document.querySelector('#sRFC')?.value || ''")
+            logger.info(f"Certificado validado en el formulario con sRFC: {s_rfc_val}")
         except Exception:
-            logger.warning("El SAT no pobló #sRFC automáticamente tras el evento change; intentando continuar.")
+            logger.warning("Timeout esperando #sRFC; forzando eventos en #cert...")
+            await page.locator("#cert").dispatch_event("change")
+            await page.locator("#cert").dispatch_event("blur")
+            await page.wait_for_timeout(1000)
 
-        # 3. Cargar Llave Privada (.key)
-        key_input = page.locator("#key")
-        await key_input.set_input_files(key_path)
-        await key_input.dispatch_event("change")
-        await key_input.dispatch_event("input")
-        await page.wait_for_timeout(600)
+        # 2. Cargar Llave Privada vía botón SeleccionaArchivo (#btnLlavePrivada)
+        logger.info("Cargando llave privada .key vía FileChooser...")
+        if await page.locator("#btnLlavePrivada").count() > 0:
+            async with page.expect_file_chooser() as fc_key:
+                await page.locator("#btnLlavePrivada").click()
+            file_chooser_key = await fc_key.value
+            await file_chooser_key.set_files(key_path)
+        else:
+            await page.locator("#key").set_input_files(key_path)
+            await page.locator("#key").dispatch_event("change")
 
-        # 4. Escribir contraseña en #Password
+        # Esperar a que el SAT popule #txtLlavePrivada
+        try:
+            await page.wait_for_function(
+                """() => (document.querySelector('#txtLlavePrivada')?.value || '').length > 0""",
+                timeout=12000
+            )
+            logger.info("Llave privada validada en el formulario (#txtLlavePrivada poblado).")
+        except Exception:
+            logger.warning("Timeout esperando #txtLlavePrivada; forzando change en #key...")
+            await page.locator("#key").dispatch_event("change")
+            await page.wait_for_timeout(1000)
+
+        # 3. Contraseña de la clave privada
         pwd_input = page.locator("#Password, input[type='password']").first
-        await pwd_input.click()
         await pwd_input.fill(password)
-        await pwd_input.dispatch_event("change")
-        await pwd_input.dispatch_event("blur")
-        await page.wait_for_timeout(1000)
+        await pwd_input.press("Tab")
+        await page.wait_for_timeout(800)
 
-        # 5. Clic en el botón real del SAT (#submit1) que ejecuta Validate()
-        btn_validar = page.locator("#submit1, input[type='button'][onclick*='Validate']").first
-        if await btn_validar.count() == 0:
-            # Fallback por selector genérico
-            btn_validar = page.locator("input[type='button'][value*='Enviar' i], input[type='submit']").first
+        # 4. Clic en #submit1 (ejecuta Validate() en el portal)
+        logger.info("Pulsando #submit1 (Validate())...")
+        await page.locator("#submit1").click()
 
-        logger.info("Pulsando botón de validación y firma #submit1...")
-        await btn_validar.click()
-
-        # 6. Esperar a que el SAT genere #Firma o redirija fuera de formsloginFEA
-        logger.info("Esperando que el formulario se firme y complete la navegación...")
+        # 5. Esperar a que se genere #Firma o redirija fuera de formsloginFEA
+        logger.info("Esperando que el SAT firme el formulario y redirija...")
         try:
             await page.wait_for_function(
                 """() => {
@@ -265,9 +281,9 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                 });
                 return textNodes.join(' | ');
             }""")
-            raise Exception(f"El portal del SAT no avanzó tras presionar el botón de envío. Errores detectados: '{mensajes_error}'. URL actual: {page.url}")
+            raise Exception(f"El portal del SAT no avanzó tras el envío. Mensajes: '{mensajes_error}'. URL actual: {page.url}")
 
-        # 7. Confirmar salida definitiva de la pantalla de autenticación
+        # 6. Salida de la pantalla de login
         await page.wait_for_url(
             lambda url: "formslogin" not in url.lower() and "nidp" not in url.lower() and "login" not in url.lower(),
             timeout=30000
@@ -467,12 +483,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.15.0"
+        "version": "6.16.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.15.0"}
+    return {"status": "healthy", "version": "6.16.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
