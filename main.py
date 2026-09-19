@@ -32,7 +32,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.9.0"
+    version="6.10.0"
 )
 
 app.add_middleware(
@@ -182,13 +182,12 @@ def extraer_xmls(paquete_data) -> list:
 # ---------------------------------------------------------------------------
 
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str, rfc: str = ""):
-    """Realiza el login interactivo por e.firma en el SSO o formsloginFEA del SAT."""
+    """Realiza el login interactivo por e.firma en formsloginFEA o SSO del SAT."""
     try:
         btn_efirma = page.locator("#buttonFiel, a#btnFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
         if await btn_efirma.is_visible(timeout=3000):
             await btn_efirma.click()
 
-        # Esperar que los scripts del SAT terminen de inicializarse
         try:
             loading_msg = page.locator("text='Descargando las herramientas'")
             if await loading_msg.is_visible(timeout=2000):
@@ -207,6 +206,7 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                 if (el) {
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                     el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
                 }
             }""")
         else:
@@ -221,6 +221,7 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                 if (el) {
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                     el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
                 }
             }""")
         else:
@@ -234,28 +235,69 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
             if (el) {
                 el.value = pwd;
                 el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('input', { bubbles: true }));
                 el.dispatchEvent(new Event('blur', { bubbles: true }));
             }
         }""", password)
 
-        # 4. Asegurar que sRFC tenga el RFC del contribuyente
-        await page.wait_for_timeout(1500)
-        if rfc:
-            await page.evaluate("""(rfcVal) => {
-                const rfcInput = document.querySelector('#sRFC') || document.querySelector("input[name='sRFC']");
-                if (rfcInput && !rfcInput.value) {
-                    rfcInput.value = rfcVal;
-                    rfcInput.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-            }""", rfc.strip().upper())
+        # 4. Esperar a que el script del SAT complete el RFC en sRFC
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const el = document.querySelector('#sRFC');
+                    return el && el.value && el.value.trim().length >= 10;
+                }""",
+                timeout=12000
+            )
+        except Exception:
+            if rfc:
+                await page.evaluate("""(rfcVal) => {
+                    const el = document.querySelector('#sRFC');
+                    if (el) {
+                        el.value = rfcVal;
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }""", rfc.strip().upper())
 
         await page.wait_for_timeout(1000)
 
-        # 5. Clic en Enviar / Submit
-        btn_submit = page.locator("input#btnSubmit, input#submit, button#submit, input[type='submit'], input[value*='Enviar'], button:has-text('Enviar')").first
-        await btn_submit.click()
+        # 5. Localizar el botón de envío y esperar que esté habilitado
+        btn_selector = "input#submit, button#submit, input[type='submit'], button[type='submit'], input[value*='Enviar'], button:has-text('Enviar'), input#btnSubmit, input[onclick*='enviar'], input[onclick*='Enviar'], input[onclick*='submit']"
+        btn_submit = page.locator(btn_selector).first
 
-        # 6. Esperar a que la página cambie de URL (salga de la pantalla de login)
+        if await btn_submit.count() > 0:
+            try:
+                await btn_submit.wait_for(state="visible", timeout=5000)
+            except Exception:
+                pass
+
+        # 6. Ejecución del envío mediante clic o requestSubmit
+        enviado = False
+        if await btn_submit.count() > 0 and await btn_submit.is_enabled():
+            try:
+                await btn_submit.click(timeout=6000)
+                enviado = True
+            except Exception as e_click:
+                logger.warning(f"Clic directo falló, intentando requestSubmit(): {e_click}")
+
+        if not enviado:
+            await page.evaluate("""() => {
+                const btn = document.querySelector("input#submit, button#submit, input[type='submit'], button[type='submit'], input[value*='Enviar'], input#btnSubmit, input[onclick*='enviar']");
+                if (btn) {
+                    btn.click();
+                } else {
+                    const form = document.forms[0];
+                    if (form) {
+                        if (typeof form.requestSubmit === 'function') {
+                            form.requestSubmit();
+                        } else {
+                            form.submit();
+                        }
+                    }
+                }
+            }""")
+
+        # 7. Esperar a que la página cambie de URL
         try:
             await page.wait_for_url(
                 lambda url: "formslogin" not in url.lower() and "nidp" not in url.lower() and "login" not in url.lower(),
@@ -265,7 +307,7 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
             # Inspección detallada de errores visibles en pantalla
             mensajes_error = await page.evaluate("""() => {
                 const textNodes = [];
-                const els = document.querySelectorAll('.msg-error, #error, #lblError, font[color="red"], span[style*="red"], div[class*="error"], td.error, #divError');
+                const els = document.querySelectorAll('.msg-error, #error, #lblError, font[color="red"], span[style*="red"], div[class*="error"], td.error, #divError, .alert-danger');
                 els.forEach(el => {
                     if (el.innerText && el.innerText.trim().length > 0) {
                         textNodes.push(el.innerText.trim());
@@ -273,7 +315,7 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                 });
                 return textNodes.join(' | ');
             }""")
-            
+
             s_rfc_val = await page.evaluate("""() => {
                 const el = document.querySelector('#sRFC');
                 return el ? el.value : 'no encontrado';
@@ -281,8 +323,8 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
 
             if mensajes_error:
                 raise Exception(f"El SAT reportó: {mensajes_error} (sRFC={s_rfc_val})")
-            
-            raise Exception(f"El portal del SAT no redirigió (permanece en {page.url} con sRFC={s_rfc_val}). El botón Enviar no procesó la solicitud.")
+
+            raise Exception(f"El portal del SAT no avanzó tras el envío (permanece en {page.url} con sRFC={s_rfc_val}).")
 
         await page.wait_for_load_state("networkidle", timeout=30000)
 
@@ -479,12 +521,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.9.0"
+        "version": "6.10.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.9.0"}
+    return {"status": "healthy", "version": "6.10.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
