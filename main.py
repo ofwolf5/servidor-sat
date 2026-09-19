@@ -32,7 +32,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.8.0"
+    version="6.9.0"
 )
 
 app.add_middleware(
@@ -51,7 +51,6 @@ CHROME_ARGS = [
     "--disable-blink-features=AutomationControlled"
 ]
 
-# Almacén en memoria de tareas en segundo plano
 TASKS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
@@ -185,63 +184,105 @@ def extraer_xmls(paquete_data) -> list:
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str, rfc: str = ""):
     """Realiza el login interactivo por e.firma en el SSO o formsloginFEA del SAT."""
     try:
-        # 1. Si está el botón/pestaña de e.firma, hacer clic
         btn_efirma = page.locator("#buttonFiel, a#btnFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
         if await btn_efirma.is_visible(timeout=3000):
             await btn_efirma.click()
 
-        # 2. Esperar campos de archivos
-        await page.wait_for_selector("input[type='file'], input#cert, input#fileCertificate", state="attached", timeout=25000)
+        # Esperar que los scripts del SAT terminen de inicializarse
+        try:
+            loading_msg = page.locator("text='Descargando las herramientas'")
+            if await loading_msg.is_visible(timeout=2000):
+                await loading_msg.wait_for(state="hidden", timeout=25000)
+        except Exception:
+            pass
 
-        # 3. Cargar Certificado (.cer)
-        cer_input = page.locator("input#cert, input#fileCertificate, input[name*='cert']").first
-        if await cer_input.count() > 0:
-            await cer_input.set_input_files(cer_path)
-            await cer_input.dispatch_event("change")
+        await page.wait_for_selector("input#cert, input[type='file']", state="attached", timeout=25000)
+
+        # 1. Cargar Certificado (.cer)
+        cer_elem = page.locator("input#cert, input#fileCertificate, input[name*='cert']").first
+        if await cer_elem.count() > 0:
+            await cer_elem.set_input_files(cer_path)
+            await page.evaluate("""() => {
+                const el = document.querySelector('input#cert') || document.querySelector("input[name*='cert']");
+                if (el) {
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            }""")
         else:
             await page.locator("input[type='file']").nth(0).set_input_files(cer_path)
-            await page.locator("input[type='file']").nth(0).dispatch_event("change")
 
-        await page.wait_for_timeout(800)
-
-        # 4. Cargar Clave Privada (.key)
-        key_input = page.locator("input#key, input#filePrivateKey, input[name*='key']").first
-        if await key_input.count() > 0:
-            await key_input.set_input_files(key_path)
-            await key_input.dispatch_event("change")
+        # 2. Cargar Clave Privada (.key)
+        key_elem = page.locator("input#key, input#filePrivateKey, input[name*='key']").first
+        if await key_elem.count() > 0:
+            await key_elem.set_input_files(key_path)
+            await page.evaluate("""() => {
+                const el = document.querySelector('input#key') || document.querySelector("input[name*='key']");
+                if (el) {
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+            }""")
         else:
             await page.locator("input[type='file']").nth(1).set_input_files(key_path)
-            await page.locator("input[type='file']").nth(1).dispatch_event("change")
 
-        await page.wait_for_timeout(800)
-
-        # 5. Contraseña de clave privada
+        # 3. Contraseña
         pwd_input = page.locator("input#password, input#privateKeyPassword, input#txtPassword, input[type='password']").first
         await pwd_input.fill(password)
-        await pwd_input.dispatch_event("change")
-        await pwd_input.dispatch_event("blur")
+        await page.evaluate("""(pwd) => {
+            const el = document.querySelector('input#password') || document.querySelector("input[type='password']");
+            if (el) {
+                el.value = pwd;
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            }
+        }""", password)
 
-        # 6. Esperar a que el script del SAT procese el .cer y auto-llene el RFC o 2 segundos
-        await page.wait_for_timeout(2000)
+        # 4. Asegurar que sRFC tenga el RFC del contribuyente
+        await page.wait_for_timeout(1500)
+        if rfc:
+            await page.evaluate("""(rfcVal) => {
+                const rfcInput = document.querySelector('#sRFC') || document.querySelector("input[name='sRFC']");
+                if (rfcInput && !rfcInput.value) {
+                    rfcInput.value = rfcVal;
+                    rfcInput.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }""", rfc.strip().upper())
 
-        # 7. Enviar formulario
-        btn_submit = page.locator("input#submit, button#submit, input[type='submit'], input[value*='Enviar'], button:has-text('Enviar'), input#btnSubmit").first
+        await page.wait_for_timeout(1000)
+
+        # 5. Clic en Enviar / Submit
+        btn_submit = page.locator("input#btnSubmit, input#submit, button#submit, input[type='submit'], input[value*='Enviar'], button:has-text('Enviar')").first
         await btn_submit.click()
 
-        # 8. Esperar a que la página cambie de URL (salga de la pantalla de login)
+        # 6. Esperar a que la página cambie de URL (salga de la pantalla de login)
         try:
             await page.wait_for_url(
                 lambda url: "formslogin" not in url.lower() and "nidp" not in url.lower() and "login" not in url.lower(),
-                timeout=30000
+                timeout=35000
             )
         except Exception:
-            # Extraer posibles mensajes de error en rojo
-            error_locators = page.locator(".msg-error, #error, #lblError, font[color='red'], span[style*='red'], div[class*='error']")
-            mensajes = await error_locators.all_text_contents()
-            error_limpio = " ".join([m.strip() for m in mensajes if m.strip()])
-            if error_limpio:
-                raise Exception(f"El SAT reportó: {error_limpio}")
-            raise Exception(f"El acceso con e.firma no avanzó (permanece en {page.url}). Verifique contraseña o vigencia de la FIEL.")
+            # Inspección detallada de errores visibles en pantalla
+            mensajes_error = await page.evaluate("""() => {
+                const textNodes = [];
+                const els = document.querySelectorAll('.msg-error, #error, #lblError, font[color="red"], span[style*="red"], div[class*="error"], td.error, #divError');
+                els.forEach(el => {
+                    if (el.innerText && el.innerText.trim().length > 0) {
+                        textNodes.push(el.innerText.trim());
+                    }
+                });
+                return textNodes.join(' | ');
+            }""")
+            
+            s_rfc_val = await page.evaluate("""() => {
+                const el = document.querySelector('#sRFC');
+                return el ? el.value : 'no encontrado';
+            }""")
+
+            if mensajes_error:
+                raise Exception(f"El SAT reportó: {mensajes_error} (sRFC={s_rfc_val})")
+            
+            raise Exception(f"El portal del SAT no redirigió (permanece en {page.url} con sRFC={s_rfc_val}). El botón Enviar no procesó la solicitud.")
 
         await page.wait_for_load_state("networkidle", timeout=30000)
 
@@ -283,7 +324,6 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
 
                 await page.wait_for_load_state("networkidle", timeout=35000)
 
-                # Descartar avisos o modales emergentes
                 try:
                     btn_cerrar = page.locator("button:has-text('Aceptar'), button:has-text('Continuar'), button:has-text('Cerrar'), .ui-dialog-titlebar-close, a:has-text('Continuar')").first
                     if await btn_cerrar.is_visible(timeout=3000):
@@ -439,12 +479,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.8.0"
+        "version": "6.9.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.8.0"}
+    return {"status": "healthy", "version": "6.9.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
