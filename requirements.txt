@@ -5,5 +5,5 @@ cryptography
 cfdiclient
 pydantic
 requests
-playwright
-pypdf
+playwright>=1.40.0
+pypdf>=3.17.0
