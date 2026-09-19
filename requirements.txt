@@ -1,9 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 cryptography
+pypdf
 cfdiclient
-pydantic
-requests
-playwright>=1.40.0
-pypdf>=3.17.0
+satcfdi
