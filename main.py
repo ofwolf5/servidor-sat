@@ -30,7 +30,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D",
-    version="6.2.0"
+    version="6.3.0"
 )
 
 app.add_middleware(
@@ -180,26 +180,33 @@ def extraer_xmls(paquete_data) -> list:
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str):
     """Realiza el login interactivo por e.firma en el SSO del SAT."""
     try:
-        # Pestaña e.firma
-        btn_efirma = page.locator("#buttonFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
+        # 1. Si está la pestaña/botón de e.firma, hacer clic
+        btn_efirma = page.locator("#buttonFiel, a#btnFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
         if await btn_efirma.is_visible(timeout=4000):
             await btn_efirma.click()
 
-        await page.wait_for_selector("input[type='file']", timeout=20000)
-        
-        file_inputs = await page.locator("input[type='file']").all()
-        if len(file_inputs) >= 2:
-            await file_inputs[0].set_input_files(cer_path)
-            await file_inputs[1].set_input_files(key_path)
+        # 2. Esperar a que los inputs existan en el DOM (state='attached' porque suelen estar ocultos por CSS)
+        await page.wait_for_selector("input#cert, input[name='cert'], input[type='file']", state="attached", timeout=25000)
+
+        # 3. Asignar archivos a los inputs específicos del SAT
+        if await page.locator("input#cert").count() > 0:
+            await page.set_input_files("input#cert", cer_path)
+            await page.set_input_files("input#key", key_path)
         else:
-            await page.set_input_files("input#fileCertificate, input[name*='cert']", cer_path)
-            await page.set_input_files("input#filePrivateKey, input[name*='key']", key_path)
+            file_inputs = page.locator("input[type='file']")
+            await file_inputs.nth(0).set_input_files(cer_path)
+            await file_inputs.nth(1).set_input_files(key_path)
 
-        await page.fill("input#privateKeyPassword, input#txtPassword, input[type='password']", password)
+        # 4. Ingresar contraseña de la clave privada
+        pwd_input = page.locator("input#password, input#privateKeyPassword, input#txtPassword, input[type='password']").first
+        await pwd_input.fill(password)
 
-        btn_submit = page.locator("input#submit, button#submit, input[type='submit'], button:has-text('Enviar')").first
+        # 5. Enviar formulario
+        btn_submit = page.locator("input#submit, button#submit, input[type='submit'], input[value*='Enviar'], button:has-text('Enviar')").first
         await btn_submit.click()
-        await page.wait_for_load_state("networkidle", timeout=30000)
+
+        # 6. Esperar a que el SAT procese el login y redirija
+        await page.wait_for_load_state("networkidle", timeout=35000)
     except Exception as e:
         logger.error(f"Falla durante la autenticación e.firma: {e}")
         raise HTTPException(status_code=401, detail=f"No se pudo completar el acceso con e.firma al SAT: {str(e)}")
@@ -214,12 +221,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright",
-        "version": "6.2.0"
+        "version": "6.3.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.2.0"}
+    return {"status": "healthy", "version": "6.3.0"}
 
 # ---------------------------------------------------------------------------
 # CFDI Descarga Masiva
@@ -411,11 +418,9 @@ async def obtener_opinion_cumplimiento(
             page = await context.new_page()
 
             try:
-                # URL oficial de acceso a Opinión de Cumplimiento
                 url_opinion = "https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/"
                 await page.goto(url_opinion, wait_until="domcontentloaded", timeout=60000)
 
-                # Si pide autenticación por e.firma
                 if "login" in page.url.lower() or "nidp" in page.url.lower() or "acceso" in page.url.lower():
                     await autenticar_portal_sat(page, cer_path, key_path, password)
 
@@ -490,7 +495,6 @@ async def obtener_csf(
             page = await context.new_page()
 
             try:
-                # URL oficial y pública de reimpresión de acuses del RFC y CSF
                 url_cif = "https://www.acuse.sat.gob.mx/ReimpresionInternet/REIMDefault.htm"
                 await page.goto(url_cif, wait_until="domcontentloaded", timeout=60000)
 
@@ -499,7 +503,6 @@ async def obtener_csf(
 
                 await page.wait_for_load_state("networkidle", timeout=30000)
 
-                # Localizar el botón 'Generar Constancia' en página o frames
                 btn_generar = page.locator("button:has-text('Generar Constancia'), input[value*='Generar Constancia'], a:has-text('Generar Constancia')").first
 
                 if not await btn_generar.is_visible():
