@@ -32,7 +32,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.5.0"
+    version="6.6.0"
 )
 
 app.add_middleware(
@@ -182,33 +182,69 @@ def extraer_xmls(paquete_data) -> list:
 # Automatización Portal SAT (Playwright)
 # ---------------------------------------------------------------------------
 
-async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str):
-    """Realiza el login interactivo por e.firma en el SSO del SAT."""
+async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str, rfc: str = ""):
+    """Realiza el login interactivo por e.firma en el SSO del SAT y valida la redirección."""
     try:
+        # 1. Si está la pestaña/botón de e.firma, hacer clic
         btn_efirma = page.locator("#buttonFiel, a#btnFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
-        if await btn_efirma.is_visible(timeout=4000):
+        if await btn_efirma.is_visible(timeout=3000):
             await btn_efirma.click()
 
-        await page.wait_for_selector("input#cert, input[name='cert'], input[type='file']", state="attached", timeout=30000)
+        # 2. Esperar campos de archivos
+        await page.wait_for_selector("input#cert, input[name='cert'], input[type='file']", state="attached", timeout=25000)
 
+        # 3. Asignar archivos .cer y .key y disparar evento change
         if await page.locator("input#cert").count() > 0:
             await page.set_input_files("input#cert", cer_path)
+            await page.locator("input#cert").dispatch_event("change")
+        if await page.locator("input#key").count() > 0:
             await page.set_input_files("input#key", key_path)
-        else:
+            await page.locator("input#key").dispatch_event("change")
+        
+        if await page.locator("input#cert").count() == 0:
             file_inputs = page.locator("input[type='file']")
-            await file_inputs.nth(0).set_input_files(cer_path)
-            await file_inputs.nth(1).set_input_files(key_path)
+            if await file_inputs.count() >= 2:
+                await file_inputs.nth(0).set_input_files(cer_path)
+                await file_inputs.nth(0).dispatch_event("change")
+                await file_inputs.nth(1).set_input_files(key_path)
+                await file_inputs.nth(1).dispatch_event("change")
 
+        # 4. Campo RFC (indispensable en formularios ASP como formsloginFEA.asp)
+        if rfc:
+            rfc_input = page.locator("input#rfc, input#txtRfc, input[name*='rfc'], input[name*='RFC']").first
+            if await rfc_input.count() > 0:
+                try:
+                    if await rfc_input.is_visible():
+                        await rfc_input.fill(rfc.strip().upper())
+                        await rfc_input.dispatch_event("change")
+                except Exception:
+                    pass
+
+        # 5. Contraseña
         pwd_input = page.locator("input#password, input#privateKeyPassword, input#txtPassword, input[type='password']").first
         await pwd_input.fill(password)
+        await pwd_input.dispatch_event("change")
 
-        btn_submit = page.locator("input#submit, button#submit, input[type='submit'], input[value*='Enviar'], button:has-text('Enviar')").first
+        # 6. Clic en Enviar
+        btn_submit = page.locator("input#submit, button#submit, input[type='submit'], input[value*='Enviar'], button:has-text('Enviar'), input#btnSubmit").first
         await btn_submit.click()
 
-        await page.wait_for_load_state("networkidle", timeout=40000)
+        # 7. Validar que la página realmente salga de la pantalla de autenticación
+        try:
+            await page.wait_for_url(lambda url: "formslogin" not in url.lower() and "nidp" not in url.lower(), timeout=25000)
+        except Exception:
+            # Si no avanzó, buscar el mensaje de error explícito que devolvió el SAT
+            error_msg = await page.locator(".msg-error, #error, #lblError, span[class*='error'], div[class*='error'], p[class*='error']").all_text_contents()
+            error_limpio = " ".join([m.strip() for m in error_msg if m.strip()])
+            if error_limpio:
+                raise Exception(f"El SAT rechazó la e.firma: {error_limpio}")
+            raise Exception(f"El acceso al SAT no avanzó (permanece en {page.url}). Verifique la contraseña o vigencia de la FIEL.")
+
+        await page.wait_for_load_state("networkidle", timeout=30000)
+
     except Exception as e:
         logger.error(f"Falla durante la autenticación e.firma: {e}")
-        raise Exception(f"No se pudo autenticar con e.firma en el portal SAT: {str(e)}")
+        raise Exception(f"No se pudo completar el acceso con e.firma al SAT: {str(e)}")
 
 # ---------------------------------------------------------------------------
 # Workers en Segundo Plano
@@ -240,11 +276,11 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
                 await page.goto(url_cif, wait_until="domcontentloaded", timeout=70000)
 
                 if any(x in page.url.lower() for x in ["login", "nidp", "acceso", "formslogin"]):
-                    await autenticar_portal_sat(page, cer_path, key_path, password)
+                    await autenticar_portal_sat(page, cer_path, key_path, password, rfc=rfc)
 
                 await page.wait_for_load_state("networkidle", timeout=35000)
 
-                # Descartar avisos o modales emergentes
+                # Cerrar modales de avisos del SAT si existen
                 try:
                     btn_cerrar = page.locator("button:has-text('Aceptar'), button:has-text('Continuar'), button:has-text('Cerrar'), .ui-dialog-titlebar-close, a:has-text('Continuar')").first
                     if await btn_cerrar.is_visible(timeout=3000):
@@ -331,7 +367,7 @@ async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: byt
                 await page.goto(url_opinion, wait_until="domcontentloaded", timeout=70000)
 
                 if any(x in page.url.lower() for x in ["login", "nidp", "acceso"]):
-                    await autenticar_portal_sat(page, cer_path, key_path, password)
+                    await autenticar_portal_sat(page, cer_path, key_path, password, rfc=rfc)
 
                 await page.wait_for_load_state("networkidle", timeout=45000)
 
@@ -394,12 +430,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.5.0"
+        "version": "6.6.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.5.0"}
+    return {"status": "healthy", "version": "6.6.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
