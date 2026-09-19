@@ -5,3 +5,5 @@ cryptography
 cfdiclient
 pydantic
 requests
+playwright
+pypdf
