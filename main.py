@@ -33,7 +33,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.12.0"
+    version="6.13.0"
 )
 
 app.add_middleware(
@@ -179,7 +179,7 @@ def extraer_xmls(paquete_data) -> list:
     return xmls
 
 # ---------------------------------------------------------------------------
-# Automatización Portal SAT (Playwright con diagnóstico de inputs)
+# Automatización Portal SAT (Playwright con clic robusto y multi-frame)
 # ---------------------------------------------------------------------------
 
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str, rfc: str = ""):
@@ -203,7 +203,6 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
         # 1. Localización estricta de campos de archivo
         file_inputs = await page.locator("input[type='file']").all()
         if len(file_inputs) >= 2:
-            # En formsloginFEA el primer file input siempre corresponde al .cer y el segundo al .key
             await file_inputs[0].set_input_files(cer_path)
             await file_inputs[0].dispatch_event("change")
             await page.wait_for_timeout(600)
@@ -231,7 +230,7 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
         except Exception:
             logger.warning("El portal del SAT no pobló el campo sRFC automáticamente tras 12s.")
 
-        # 3. Tecleo real de la contraseña (dispara eventos nativos del teclado)
+        # 3. Tecleo real de la contraseña
         pwd_input = page.locator("input#password, input#privateKeyPassword, input#txtPassword, input[type='password']").first
         await pwd_input.click()
         await pwd_input.press_sequentially(password, delay=70)
@@ -258,7 +257,6 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
         except Exception:
             pass
 
-        # Si no se detectó el token por nombre estándar, hacemos volcado diagnóstico completo de inputs
         if not token_listo:
             dump_inputs = await page.evaluate("""() => {
                 return [...document.querySelectorAll('input')].map(e => ({
@@ -269,19 +267,52 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                     onclick: e.getAttribute('onclick') || ''
                 }));
             }""")
-            logger.error(f"Volcado de inputs en formsloginFEA: {json.dumps(dump_inputs)}")
-            
-            # Revisar si al menos alguno tiene longitud significativa (>30 chars) que indique token firmado
-            tiene_firma = any(inp['val_len'] > 30 and inp['type'] == 'hidden' for inp in dump_inputs)
-            if not tiene_firma:
-                raise Exception(
-                    f"El JavaScript del portal del SAT no generó la firma del reto tras teclear la contraseña. "
-                    f"Diagnóstico de campos en página: {dump_inputs}"
-                )
+            logger.warning(f"Volcado de inputs en formsloginFEA: {json.dumps(dump_inputs)}")
 
-        # 5. Pulsar el botón real de envío del SAT
-        btn_enviar = page.locator("input[type='button'][value*='Enviar'], input[name='submit'], input#submit, #submit, button:has-text('Enviar')").first
-        await btn_enviar.click()
+        # 5. Localizar y pulsar el botón visible y habilitado recorriendo todos los frames
+        selectores = [
+            "input[type='submit']",
+            "input[type='image']",
+            "input[type='button'][value*='Enviar' i]",
+            "button[type='submit']",
+            "button:has-text('Enviar')",
+            "[onclick*='enviar' i]",
+            "[onclick*='submit' i]"
+        ]
+        
+        enviado = False
+        for frame in page.frames:
+            for selector in selectores:
+                elementos = frame.locator(selector)
+                total = await elementos.count()
+                for i in range(total):
+                    boton = elementos.nth(i)
+                    if await boton.is_visible() and await boton.is_enabled():
+                        logger.info(f"Botón de envío encontrado en frame con selector: {selector}")
+                        await boton.click()
+                        enviado = True
+                        break
+                if enviado:
+                    break
+            if enviado:
+                break
+
+        if not enviado:
+            controles = await page.locator(
+                "button, input[type='submit'], input[type='button'], input[type='image']"
+            ).evaluate_all("""
+                els => els.map(el => ({
+                    tag: el.tagName,
+                    id: el.id,
+                    name: el.name,
+                    type: el.type,
+                    value: el.value,
+                    text: el.innerText,
+                    visible: !!(el.offsetWidth || el.offsetHeight),
+                    disabled: el.disabled
+                }))
+            """)
+            raise Exception(f"No se encontró un botón de envío visible y habilitado. Controles: {controles}")
 
         # 6. Esperar a que la página cambie de URL
         try:
@@ -499,12 +530,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.12.0"
+        "version": "6.13.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.12.0"}
+    return {"status": "healthy", "version": "6.13.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
