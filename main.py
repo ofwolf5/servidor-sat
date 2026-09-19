@@ -12,6 +12,7 @@ import re
 import tempfile
 import uuid
 import logging
+import json
 import asyncio
 
 from playwright.async_api import async_playwright
@@ -32,7 +33,7 @@ logger = logging.getLogger("sat_service")
 app = FastAPI(
     title="Microservicio SAT Integral",
     description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (Async Polling)",
-    version="6.11.0"
+    version="6.12.0"
 )
 
 app.add_middleware(
@@ -178,11 +179,11 @@ def extraer_xmls(paquete_data) -> list:
     return xmls
 
 # ---------------------------------------------------------------------------
-# Automatización Portal SAT (Playwright con emulación criptográfica real)
+# Automatización Portal SAT (Playwright con diagnóstico de inputs)
 # ---------------------------------------------------------------------------
 
 async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: str, rfc: str = ""):
-    """Realiza el login por e.firma permitiendo que el JS del SAT descifre la llave y firme el reto."""
+    """Realiza el login por e.firma asegurando la asignación correcta de archivos y tecleo real."""
     try:
         # Pestaña e.firma si aparece
         btn_efirma = page.locator("#buttonFiel, a#btnFiel, a[href*='fiel'], button:has-text('e.firma'), a:has-text('e.firma')").first
@@ -197,17 +198,27 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
         except Exception:
             pass
 
-        await page.wait_for_selector("input#cert, input[type='file']", state="attached", timeout=25000)
+        await page.wait_for_selector("input[type='file']", state="attached", timeout=25000)
 
-        # 1. Cargar Certificado (.cer)
-        cer_elem = page.locator("input#cert, input#fileCertificate, input[name*='cert']").first
-        if await cer_elem.count() > 0:
+        # 1. Localización estricta de campos de archivo
+        file_inputs = await page.locator("input[type='file']").all()
+        if len(file_inputs) >= 2:
+            # En formsloginFEA el primer file input siempre corresponde al .cer y el segundo al .key
+            await file_inputs[0].set_input_files(cer_path)
+            await file_inputs[0].dispatch_event("change")
+            await page.wait_for_timeout(600)
+            await file_inputs[1].set_input_files(key_path)
+            await file_inputs[1].dispatch_event("change")
+        else:
+            cer_elem = page.locator("input#cert, input#fileCertificate, input[name*='cert']").first
+            key_elem = page.locator("input#key, input#filePrivateKey, input[name*='key']").first
             await cer_elem.set_input_files(cer_path)
             await cer_elem.dispatch_event("change")
-        else:
-            await page.locator("input[type='file']").nth(0).set_input_files(cer_path)
+            await page.wait_for_timeout(600)
+            await key_elem.set_input_files(key_path)
+            await key_elem.dispatch_event("change")
 
-        # Esperar a que el script del SAT procese el .cer y popule el campo de RFC
+        # 2. Esperar que el script del SAT popule sRFC
         try:
             await page.wait_for_function(
                 """() => {
@@ -216,47 +227,63 @@ async def autenticar_portal_sat(page, cer_path: str, key_path: str, password: st
                 }""",
                 timeout=12000
             )
+            logger.info("El portal del SAT reconoció el certificado y extrajo el RFC.")
         except Exception:
-            logger.warning("El SAT no pobló el sRFC automáticamente tras el .cer; continuando.")
+            logger.warning("El portal del SAT no pobló el campo sRFC automáticamente tras 12s.")
 
-        # 2. Cargar Llave Privada (.key)
-        key_elem = page.locator("input#key, input#filePrivateKey, input[name*='key']").first
-        if await key_elem.count() > 0:
-            await key_elem.set_input_files(key_path)
-            await key_elem.dispatch_event("change")
-        else:
-            await page.locator("input[type='file']").nth(1).set_input_files(key_path)
-
-        await page.wait_for_timeout(800)
-
-        # 3. Contraseña con tecleo real (dispara CamposLogin_FEA y el descifrado de la llave)
+        # 3. Tecleo real de la contraseña (dispara eventos nativos del teclado)
         pwd_input = page.locator("input#password, input#privateKeyPassword, input#txtPassword, input[type='password']").first
         await pwd_input.click()
-        await pwd_input.press_sequentially(password, delay=60)
+        await pwd_input.press_sequentially(password, delay=70)
         await pwd_input.press("Tab")
-
-        # 4. Esperar a que el script del SAT descifre la llave y firme el reto (token > 20 caracteres)
-        logger.info("Esperando que el script del SAT genere el token firmado...")
-        try:
-            await page.wait_for_function(
-                """() => {
-                    const t = document.querySelector("[name='token']") || document.querySelector("#token");
-                    return t && t.value && t.value.trim().length > 20;
-                }""",
-                timeout=30000
-            )
-            logger.info("Token criptográfico generado exitosamente por el SAT.")
-        except Exception:
-            # Si el token no se generó, el descifrado de la llave falló en el cliente
-            raise Exception("No se generó el token de firma en el portal del SAT. Verifique que la contraseña sea correcta para el archivo .key seleccionado.")
-
         await page.wait_for_timeout(1000)
 
-        # 5. Localizar y pulsar el botón real del SAT (input type='button' con onclick)
+        # 4. Monitorear campos generados por el JavaScript del SAT
+        logger.info("Esperando que el script del SAT procese la firma del reto...")
+        token_listo = False
+        try:
+            token_listo = await page.wait_for_function(
+                """() => {
+                    const candidates = document.querySelectorAll("input[type='hidden'], input");
+                    for (const el of candidates) {
+                        const n = (el.name || el.id || '').toLowerCase();
+                        if (n.includes('token') || n.includes('fert') || n.includes('solicitud') || n.includes('firma')) {
+                            if (el.value && el.value.trim().length > 20) return true;
+                        }
+                    }
+                    return false;
+                }""",
+                timeout=20000
+            )
+        except Exception:
+            pass
+
+        # Si no se detectó el token por nombre estándar, hacemos volcado diagnóstico completo de inputs
+        if not token_listo:
+            dump_inputs = await page.evaluate("""() => {
+                return [...document.querySelectorAll('input')].map(e => ({
+                    id: e.id || '',
+                    name: e.name || '',
+                    type: e.type || '',
+                    val_len: (e.value || '').length,
+                    onclick: e.getAttribute('onclick') || ''
+                }));
+            }""")
+            logger.error(f"Volcado de inputs en formsloginFEA: {json.dumps(dump_inputs)}")
+            
+            # Revisar si al menos alguno tiene longitud significativa (>30 chars) que indique token firmado
+            tiene_firma = any(inp['val_len'] > 30 and inp['type'] == 'hidden' for inp in dump_inputs)
+            if not tiene_firma:
+                raise Exception(
+                    f"El JavaScript del portal del SAT no generó la firma del reto tras teclear la contraseña. "
+                    f"Diagnóstico de campos en página: {dump_inputs}"
+                )
+
+        # 5. Pulsar el botón real de envío del SAT
         btn_enviar = page.locator("input[type='button'][value*='Enviar'], input[name='submit'], input#submit, #submit, button:has-text('Enviar')").first
         await btn_enviar.click()
 
-        # 6. Esperar a que la página salga de la pantalla de login
+        # 6. Esperar a que la página cambie de URL
         try:
             await page.wait_for_url(
                 lambda url: "formslogin" not in url.lower() and "nidp" not in url.lower() and "login" not in url.lower(),
@@ -472,12 +499,12 @@ def ruta_raiz():
         "status": "ok",
         "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
         "motor": "cfdiclient + playwright async",
-        "version": "6.11.0"
+        "version": "6.12.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "6.11.0"}
+    return {"status": "healthy", "version": "6.12.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
