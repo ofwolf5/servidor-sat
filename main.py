@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 import base64
@@ -14,10 +14,8 @@ import time
 import asyncio
 
 import pypdf
-import requests
-from bs4 import BeautifulSoup
 
-# Librería para descarga masiva de CFDI (SOAP oficial)
+# Descarga masiva oficial de CFDI (SOAP)
 from cfdiclient import (
     Fiel,
     Autenticacion,
@@ -27,7 +25,7 @@ from cfdiclient import (
     DescargaMasiva
 )
 
-# Librería para autenticación criptográfica directa por HTTP
+# Autenticación HTTP directa para CSF y Opinión 32-D
 from satcfdi.models import Signer
 from satcfdi.portal import SATPortalConstancia, SATPortalOpinionCumplimiento
 
@@ -36,8 +34,8 @@ logger = logging.getLogger("sat_service")
 
 app = FastAPI(
     title="Microservicio SAT Integral",
-    description="Descarga Masiva CFDI, CSF y Opinión de Cumplimiento 32-D (HTTP Nativo)",
-    version="7.2.0"
+    description="Descarga Masiva CFDI, CSF, Opinión 32-D y Parser de Declaraciones Mensuales",
+    version="7.5.0"
 )
 
 app.add_middleware(
@@ -51,7 +49,7 @@ app.add_middleware(
 TASKS: Dict[str, Dict[str, Any]] = {}
 
 # ---------------------------------------------------------------------------
-# Utilidades Criptográficas y CFDIClient
+# Utilidades Criptográficas y Validación de Identidad
 # ---------------------------------------------------------------------------
 
 def parse_fecha(fecha_str: str, es_fin: bool = False) -> datetime:
@@ -63,34 +61,8 @@ def parse_fecha(fecha_str: str, es_fin: bool = False) -> datetime:
         return dt.replace(hour=23, minute=59, second=59)
     return dt.replace(hour=0, minute=0, second=0)
 
-def normalizar_llave_privada(key_bytes: bytes, password: str) -> bytes:
-    pwd_bytes = password.encode("utf-8") if isinstance(password, str) else password
-    try:
-        priv_key = serialization.load_der_private_key(key_bytes, password=pwd_bytes)
-    except Exception:
-        try:
-            priv_key = serialization.load_pem_private_key(key_bytes, password=pwd_bytes)
-        except Exception as e_pem:
-            logger.error(f"Falla al descifrar la llave privada con la contraseña: {e_pem}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"No se pudo descifrar el archivo .key. Verifique su contraseña: {str(e_pem)}"
-            )
-
-    return priv_key.private_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.BestAvailableEncryption(pwd_bytes)
-    )
-
-def cargar_fiel(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
-    try:
-        return Fiel(cer_bytes, key_bytes, password)
-    except Exception:
-        key_normalizada = normalizar_llave_privada(key_bytes, password)
-        return Fiel(cer_bytes, key_normalizada, password)
-
 def obtener_rfc_de_certificado(cer_bytes: bytes) -> str:
+    """Extrae el RFC del Subject del certificado X.509."""
     try:
         cert = x509.load_der_x509_certificate(cer_bytes)
         for attr in cert.subject:
@@ -106,15 +78,34 @@ def obtener_rfc_de_certificado(cer_bytes: bytes) -> str:
     return ""
 
 def resolver_rfc(rfc_param: Optional[str], cer_bytes: bytes) -> str:
+    rfc_certificado = obtener_rfc_de_certificado(cer_bytes)
+    if rfc_certificado:
+        return rfc_certificado
     if rfc_param and rfc_param.strip():
         return rfc_param.strip().upper()
-    rfc_extraido = obtener_rfc_de_certificado(cer_bytes)
-    if rfc_extraido:
-        return rfc_extraido
     raise HTTPException(
         status_code=400,
-        detail="No se pudo determinar el RFC. Envíe el RFC en el formulario o verifique el .cer."
+        detail="No se pudo determinar el RFC a partir del certificado .cer."
     )
+
+def cargar_fiel_cfdiclient(cer_bytes: bytes, key_bytes: bytes, password: str) -> Fiel:
+    pwd_bytes = password.encode("utf-8") if isinstance(password, str) else password
+    try:
+        return Fiel(cer_bytes, key_bytes, password)
+    except Exception:
+        pass
+
+    try:
+        priv_key = serialization.load_der_private_key(key_bytes, password=pwd_bytes)
+    except Exception:
+        priv_key = serialization.load_pem_private_key(key_bytes, password=pwd_bytes)
+
+    key_pkcs8_der = priv_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(pwd_bytes)
+    )
+    return Fiel(cer_bytes, key_pkcs8_der, password)
 
 def obtener_token_fresco(fiel: Fiel) -> str:
     try:
@@ -124,7 +115,7 @@ def obtener_token_fresco(fiel: Fiel) -> str:
             raise Exception("El SAT no devolvió token.")
         return token
     except Exception as e:
-        logger.error(f"Error obteniendo token SAT: {e}")
+        logger.error(f"Error obteniendo token SOAP SAT: {e}")
         raise HTTPException(
             status_code=401,
             detail=f"Falla de autenticación con el SAT (InvalidSecurity): {str(e)}"
@@ -175,7 +166,178 @@ def extraer_xmls(paquete_data) -> list:
     return xmls
 
 # ---------------------------------------------------------------------------
-# Workers en Segundo Plano (satcfdi con manejo robusto para 32-D)
+# Motor Parser de Declaraciones SAT (PDF)
+# ---------------------------------------------------------------------------
+
+def limpiar_monto_pdf(texto_monto: Optional[str]) -> float:
+    if not texto_monto:
+        return 0.0
+    limpio = re.sub(r"[^\d.-]", "", texto_monto)
+    try:
+        return float(limpio) if limpio else 0.0
+    except ValueError:
+        return 0.0
+
+def parsear_acuse_sat_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
+    reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+    texto_paginas = []
+    for pag in reader.pages:
+        txt = pag.extract_text()
+        if txt:
+            texto_paginas.append(txt)
+    texto = "\n".join(texto_paginas)
+    
+    lineas = [l.strip() for l in texto.split("\n") if l.strip()]
+    texto_unificado = " ".join(lineas)
+
+    # 1. Metadatos
+    rfc_match = re.search(r"RFC:\s*([A-Z&Ñ]{3,4}\d{6}[A-V1-9][A-Z\d]{2})", texto, re.IGNORECASE)
+    folio_match = re.search(r"(?:Número de operación|No\. de operación|Folio):\s*(\d{10,20})", texto, re.IGNORECASE)
+    fecha_pres_match = re.search(r"Fecha y hora de presentación:\s*(\d{2}/\d{2}/\d{4}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)", texto, re.IGNORECASE)
+    ejercicio_match = re.search(r"Ejercicio:\s*(\d{4})", texto, re.IGNORECASE)
+    periodo_match = re.search(r"Periodo:\s*([A-Za-z]+(?:\s*-\s*[A-Za-z]+)?)", texto, re.IGNORECASE)
+    tipo_dec_match = re.search(r"Tipo de declaración:\s*([A-Za-z\s]+?)(?:\s{2,}|Fecha|Número|$)", texto, re.IGNORECASE)
+
+    razon_social = ""
+    rs_match = re.search(r"(?:Denominación o razón social|Nombre, denominación o razón social):\s*([^\n\r]+?)(?:\s{2,}|RFC:|$)", texto, re.IGNORECASE)
+    if rs_match:
+        razon_social = rs_match.group(1).strip()
+
+    resultado: Dict[str, Any] = {
+        "metadatos": {
+            "rfc": rfc_match.group(1).upper() if rfc_match else "",
+            "razon_social": razon_social,
+            "ejercicio": int(ejercicio_match.group(1)) if ejercicio_match else None,
+            "periodo": periodo_match.group(1).strip() if periodo_match else "",
+            "tipo_declaracion": tipo_dec_match.group(1).strip() if tipo_dec_match else "Normal",
+            "folio_operacion": folio_match.group(1) if folio_match else "",
+            "fecha_presentacion": fecha_pres_match.group(1) if fecha_pres_match else "",
+        },
+        "iva": {
+            "actos_gravados_16": 0.0,
+            "actos_gravados_8": 0.0,
+            "actos_gravados_0": 0.0,
+            "actos_exentos": 0.0,
+            "iva_trasladado_cobrado": 0.0,
+            "iva_acreditable_pagado": 0.0,
+            "retenciones_iva_que_le_efectuaron": 0.0,
+            "iva_a_cargo": 0.0,
+            "iva_a_favor": 0.0
+        },
+        "isr": {
+            "ingresos_nominales": 0.0,
+            "anticipos_clientes": 0.0,
+            "total_ingresos_acumulables": 0.0,
+            "isr_a_cargo": 0.0
+        },
+        "retenciones": {
+            "sueldos_y_salarios": 0.0,
+            "asimilados": 0.0,
+            "servicios_profesionales": 0.0,
+            "arrendamiento": 0.0,
+            "fletes": 0.0,
+            "resico_pf": 0.0,
+            "retenciones_iva": 0.0,
+            "otras_retenciones_isr": 0.0
+        },
+        "ieps": {
+            "ieps_trasladado": 0.0,
+            "ieps_acreditable": 0.0,
+            "ieps_a_cargo": 0.0
+        },
+        "total_a_pagar": 0.0
+    }
+
+    # IVA
+    m_iva_16 = re.search(r"(?:Total de actos o actividades gravados al 16%|Actividades gravadas al 16%)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_iva_16:
+        resultado["iva"]["actos_gravados_16"] = limpiar_monto_pdf(m_iva_16.group(1))
+
+    m_iva_tras = re.search(r"(?:IVA trasladado|Impuesto causado|Total del IVA causado)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_iva_tras:
+        resultado["iva"]["iva_trasladado_cobrado"] = limpiar_monto_pdf(m_iva_tras.group(1))
+
+    m_iva_acred = re.search(r"(?:Total del IVA acreditable|IVA acreditable del periodo|IVA acreditable)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_iva_acred:
+        resultado["iva"]["iva_acreditable_pagado"] = limpiar_monto_pdf(m_iva_acred.group(1))
+
+    m_iva_ret = re.search(r"(?:IVA que le retuvieron|Retenciones de IVA que le efectuaron)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_iva_ret:
+        resultado["iva"]["retenciones_iva_que_le_efectuaron"] = limpiar_monto_pdf(m_iva_ret.group(1))
+
+    m_iva_cargo = re.search(r"(?:Impuesto a cargo|Cantidad a cargo)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_iva_cargo:
+        resultado["iva"]["iva_a_cargo"] = limpiar_monto_pdf(m_iva_cargo.group(1))
+
+    m_iva_favor = re.search(r"(?:Saldo a favor|Cantidad a favor)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_iva_favor:
+        resultado["iva"]["iva_a_favor"] = limpiar_monto_pdf(m_iva_favor.group(1))
+
+    # ISR
+    m_isr_ing = re.search(r"(?:Ingresos nominales del mes|Ingresos nominales|Total de ingresos facturados|Total de ingresos)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_isr_ing:
+        resultado["isr"]["ingresos_nominales"] = limpiar_monto_pdf(m_isr_ing.group(1))
+
+    m_isr_anticipos = re.search(r"(?:Anticipos de clientes recibidos|Anticipos de clientes)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_isr_anticipos:
+        resultado["isr"]["anticipos_clientes"] = limpiar_monto_pdf(m_isr_anticipos.group(1))
+
+    m_isr_tot_ing = re.search(r"(?:Total de ingresos acumulables|Ingresos acumulables)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_isr_tot_ing:
+        resultado["isr"]["total_ingresos_acumulables"] = limpiar_monto_pdf(m_isr_tot_ing.group(1))
+
+    m_isr_cargo = re.search(r"(?:ISR a cargo|Pago provisional de ISR a cargo)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_isr_cargo:
+        resultado["isr"]["isr_a_cargo"] = limpiar_monto_pdf(m_isr_cargo.group(1))
+
+    # Retenciones
+    m_ret_sueldos = re.search(r"(?:Sueldos y salarios|Por sueldos y salarios)\s*.*?Monto retenido[:\s\$]*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if not m_ret_sueldos:
+        m_ret_sueldos = re.search(r"(?:ISR retenciones por salarios|Retención por salarios)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ret_sueldos:
+        resultado["retenciones"]["sueldos_y_salarios"] = limpiar_monto_pdf(m_ret_sueldos.group(1))
+
+    m_ret_asimilados = re.search(r"(?:Asimilados a salarios|Por asimilados a salarios)\s*.*?Monto retenido[:\s\$]*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ret_asimilados:
+        resultado["retenciones"]["asimilados"] = limpiar_monto_pdf(m_ret_asimilados.group(1))
+
+    m_ret_hon = re.search(r"(?:Servicios profesionales|Por servicios profesionales)\s*.*?Monto retenido[:\s\$]*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ret_hon:
+        resultado["retenciones"]["servicios_profesionales"] = limpiar_monto_pdf(m_ret_hon.group(1))
+
+    m_ret_arr = re.search(r"(?:Arrendamiento de inmuebles|Por uso o goce temporal de bienes|Arrendamiento)\s*.*?Monto retenido[:\s\$]*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ret_arr:
+        resultado["retenciones"]["arrendamiento"] = limpiar_monto_pdf(m_ret_arr.group(1))
+
+    m_ret_fletes = re.search(r"(?:Autotransporte terrestre de carga|Fletes|Servicios de autotransporte)\s*.*?Monto retenido[:\s\$]*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ret_fletes:
+        resultado["retenciones"]["fletes"] = limpiar_monto_pdf(m_ret_fletes.group(1))
+
+    m_ret_resico = re.search(r"(?:Régimen simplificado de confianza|RESICO)\s*.*?Monto retenido[:\s\$]*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ret_resico:
+        resultado["retenciones"]["resico_pf"] = limpiar_monto_pdf(m_ret_resico.group(1))
+
+    m_ret_iva_tot = re.search(r"(?:Retenciones de IVA|Total de retenciones de IVA)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ret_iva_tot:
+        resultado["retenciones"]["retenciones_iva"] = limpiar_monto_pdf(m_ret_iva_tot.group(1))
+
+    # IEPS y Total
+    m_ieps_tras = re.search(r"(?:IEPS causado|IEPS trasladado)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ieps_tras:
+        resultado["ieps"]["ieps_trasladado"] = limpiar_monto_pdf(m_ieps_tras.group(1))
+
+    m_ieps_acred = re.search(r"(?:IEPS acreditable)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_ieps_acred:
+        resultado["ieps"]["ieps_acreditable"] = limpiar_monto_pdf(m_ieps_acred.group(1))
+
+    m_total_pagar = re.search(r"(?:Total a pagar|Cantidad a pagar|Línea de captura.*?Importe a pagar)\s*[:\$]?\s*([\d,]+(?:\.\d{2})?)", texto_unificado, re.IGNORECASE)
+    if m_total_pagar:
+        resultado["total_a_pagar"] = limpiar_monto_pdf(m_total_pagar.group(1))
+
+    return resultado
+
+# ---------------------------------------------------------------------------
+# Workers en Segundo Plano: CSF y Opinión 32-D (satcfdi)
 # ---------------------------------------------------------------------------
 
 def _generar_csf_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
@@ -203,7 +365,7 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
             "pdf_base64": pdf_b64,
             "fecha_emision": datetime.now().isoformat()
         }
-        logger.info(f"CSF descargada con éxito para {rfc} en segundo plano.")
+        logger.info(f"CSF descargada con éxito para {rfc}.")
     except Exception as e:
         logger.error(f"Error generando CSF para {rfc}: {e}")
         TASKS[task_id] = {
@@ -212,53 +374,25 @@ async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, 
         }
 
 def _generar_opinion_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
-    """Descarga la Opinión 32-D con manejo de fallback directo por sesión HTTP autenticada."""
     signer = Signer.load(certificate=cer_bytes, key=key_bytes, password=password)
-    
-    # 1. Intentar con el método de satcfdi aplicando pausas de compilación
-    try:
-        op = SATPortalOpinionCumplimiento(signer)
-        time.sleep(2)
-        return op.generar_opinion_cumplimiento()
-    except Exception as e_first:
-        logger.warning(f"Método directo de SATPortalOpinionCumplimiento reportó: {e_first}. Intentando consulta manual con sesión autenticada...")
+    ultimo_error = None
+    for intento in range(1, 4):
+        try:
+            logger.info(f"Consultando Opinión 32-D vía satcfdi (Intento {intento}/3)...")
+            op = SATPortalOpinionCumplimiento(signer)
+            op.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+            })
+            pdf_bytes = op.generar_opinion_cumplimiento()
+            if pdf_bytes and len(pdf_bytes) > 500:
+                return pdf_bytes
+        except Exception as e:
+            ultimo_error = e
+            logger.warning(f"Intento {intento} falló para Opinión 32-D: {e}")
+            time.sleep(5)
 
-    # 2. Fallback: Autenticar sesión en el portal y consultar el endpoint de PDF directamente
-    sp = SATPortalConstancia(signer)
-    # Reutilizamos la sesión ya validada del portal
-    session = sp
-
-    url_opinion_base = "https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/"
-    res_home = session.get(url_opinion_base, timeout=25)
-    
-    time.sleep(3) # Esperar a que el SAT genere el folio del día
-
-    # Intentar obtener el PDF directamente
-    url_pdf = "https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/ObtenerPdf"
-    res_pdf = session.get(url_pdf, timeout=30)
-
-    if res_pdf.status_code == 200 and res_pdf.content.startswith(b"%PDF"):
-        return res_pdf.content
-
-    # Si no regresó PDF directo, buscar enlaces o mensajes en la respuesta HTML
-    soup = BeautifulSoup(res_home.text, "html.parser")
-    pdf_link = None
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if href and ("pdf" in href.lower() or "descarga" in href.lower() or "obtener" in href.lower()):
-            pdf_link = href
-            break
-
-    if pdf_link:
-        if not pdf_link.startswith("http"):
-            pdf_link = f"https://ptscconsulta.sat.gob.mx/OpinionCumplimiento/{pdf_link.lstrip('/')}"
-        res_link = session.get(pdf_link, timeout=30)
-        if res_link.status_code == 200 and res_link.content.startswith(b"%PDF"):
-            return res_link.content
-
-    # Si todo falla, capturar texto del portal para diagnóstico exacto
-    texto_error = soup.get_text(separator=" ", strip=True)[:300]
-    raise Exception(f"El SAT no devolvió el PDF de la Opinión (Status HTTP {res_pdf.status_code}). Mensaje en portal: '{texto_error}'")
+    raise ultimo_error
 
 async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "opinion", "created_at": datetime.now().isoformat()}
@@ -302,14 +436,13 @@ async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: byt
 def ruta_raiz():
     return {
         "status": "ok",
-        "servicio": "SAT Descarga Masiva, CSF y Opinión 32-D API",
-        "motor": "cfdiclient + satcfdi HTTP crypto",
-        "version": "7.2.0"
+        "servicio": "SAT Descarga Masiva, CSF, Opinión 32-D y Conciliación API",
+        "version": "7.5.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "7.2.0"}
+    return {"status": "healthy", "version": "7.5.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
@@ -318,8 +451,32 @@ def obtener_estado_tarea(task_id: str):
     return TASKS[task_id]
 
 # ---------------------------------------------------------------------------
-# Endpoints Asíncronos de CSF y Opinión 32-D
+# Endpoints de CSF, Opinión 32-D y Parseo de Declaración
 # ---------------------------------------------------------------------------
+
+@app.post("/api/sat/parse-declaracion")
+async def parse_declaracion_endpoint(archivo_acuse: UploadFile = File(...)):
+    """
+    Recibe el PDF del acuse de la declaración mensual del SAT y devuelve
+    el JSON desglosado con todos los renglones fiscales declarados.
+    """
+    if not archivo_acuse.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="El archivo proporcionado debe ser un documento PDF.")
+
+    contenido_pdf = await archivo_acuse.read()
+    if len(contenido_pdf) == 0:
+        raise HTTPException(status_code=400, detail="El archivo PDF está vacío.")
+
+    try:
+        datos_declaracion = parsear_acuse_sat_bytes(contenido_pdf)
+        return {
+            "status": "success",
+            "archivo": archivo_acuse.filename,
+            "datos": datos_declaracion
+        }
+    except Exception as e:
+        logger.error(f"Error parseando acuse SAT: {e}")
+        raise HTTPException(status_code=500, detail=f"No se pudo interpretar el acuse del SAT: {str(e)}")
 
 @app.post("/api/sat/sync-csf")
 async def iniciar_sync_csf(
@@ -382,7 +539,7 @@ async def iniciar_sync_opinion(
     }
 
 # ---------------------------------------------------------------------------
-# CFDI Descarga Masiva (cfdiclient)
+# CFDI Descarga Masiva (SOAP Oficial)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/sat/solicitar")
@@ -398,40 +555,42 @@ async def solicitar_descarga(
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
-    fiel = cargar_fiel(cer_bytes, key_bytes, password)
+    rfc_firmante = resolver_rfc(rfc, cer_bytes)
+    fiel = cargar_fiel_cfdiclient(cer_bytes, key_bytes, password)
     token = obtener_token_fresco(fiel)
 
     f_inicio_dt = parse_fecha(fecha_inicio, es_fin=False)
     f_fin_dt = parse_fecha(fecha_fin, es_fin=True)
-    rfc_solicitante = resolver_rfc(rfc, cer_bytes)
-    es_emitidos = tipo.lower() == "emitidos"
+    es_emitidos = tipo.lower().strip() == "emitidos"
 
-    logger.info(f"Solicitando {tipo} para RFC {rfc_solicitante} ({f_inicio_dt} a {f_fin_dt})")
+    logger.info(f"Enviando solicitud SOAP al SAT ({tipo}) para RFC {rfc_firmante} [{f_inicio_dt} -> {f_fin_dt}]")
 
     try:
         if es_emitidos:
             descarga = SolicitaDescargaEmitidos(fiel)
             res = descarga.solicitar_descarga(
                 token=token,
-                rfc_solicitante=rfc_solicitante,
+                rfc_solicitante=rfc_firmante,
                 fecha_inicial=f_inicio_dt,
                 fecha_final=f_fin_dt,
-                rfc_emisor=rfc_solicitante,
+                rfc_emisor=rfc_firmante,
                 tipo_solicitud="CFDI"
             )
         else:
             descarga = SolicitaDescargaRecibidos(fiel)
             res = descarga.solicitar_descarga(
                 token=token,
-                rfc_solicitante=rfc_solicitante,
+                rfc_solicitante=rfc_firmante,
                 fecha_inicial=f_inicio_dt,
                 fecha_final=f_fin_dt,
-                rfc_receptor=rfc_solicitante,
+                rfc_receptor=rfc_firmante,
                 tipo_solicitud="CFDI"
             )
 
         cod_estatus = str(res.get("cod_estatus", res.get("CodEstatus", "5000")))
         mensaje = res.get("mensaje", res.get("Mensaje", "Solicitud aceptada"))
+
+        logger.info(f"Respuesta SAT Solicitar: Codigo {cod_estatus} - {mensaje}")
 
         if cod_estatus != "5000":
             raise HTTPException(
@@ -463,16 +622,16 @@ async def verificar_solicitud(
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
-    fiel = cargar_fiel(cer_bytes, key_bytes, password)
+    rfc_firmante = resolver_rfc(rfc, cer_bytes)
+    fiel = cargar_fiel_cfdiclient(cer_bytes, key_bytes, password)
     token = obtener_token_fresco(fiel)
-    rfc_solicitante = resolver_rfc(rfc, cer_bytes)
 
     try:
         verificador = VerificaSolicitudDescarga(fiel)
         res = verificador.verificar_descarga(
             token=token,
-            rfc_solicitante=rfc_solicitante,
-            id_solicitud=id_solicitud
+            rfc_solicitante=rfc_firmante,
+            id_solicitud=id_solicitud.strip()
         )
 
         paquetes = res.get("paquetes", res.get("IdsPaquetes", []))
@@ -504,16 +663,16 @@ async def descargar_paquete(
     cer_bytes = await cer_file.read()
     key_bytes = await key_file.read()
 
-    fiel = cargar_fiel(cer_bytes, key_bytes, password)
+    rfc_firmante = resolver_rfc(rfc, cer_bytes)
+    fiel = cargar_fiel_cfdiclient(cer_bytes, key_bytes, password)
     token = obtener_token_fresco(fiel)
-    rfc_solicitante = resolver_rfc(rfc, cer_bytes)
 
     try:
         descargador = DescargaMasiva(fiel)
         res = descargador.descargar_paquete(
             token=token,
-            rfc_solicitante=rfc_solicitante,
-            id_paquete=id_paquete
+            rfc_solicitante=rfc_firmante,
+            id_paquete=id_paquete.strip()
         )
 
         paquete_b64 = res.get("paquete_b64", res.get("PaqueteB64", res.get("paquete")))
