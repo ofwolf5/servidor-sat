@@ -12,6 +12,7 @@ import uuid
 import logging
 import time
 import asyncio
+import xml.etree.ElementTree as ET
 
 import pypdf
 
@@ -34,8 +35,8 @@ logger = logging.getLogger("sat_service")
 
 app = FastAPI(
     title="Microservicio SAT Integral",
-    description="Descarga Masiva CFDI, CSF, Opinión 32-D y Parser de Declaraciones Mensuales",
-    version="7.5.0"
+    description="Descarga Masiva CFDI, CSF, Opinión 32-D, Parseo de Acuses y Conciliación Fiscal DyP",
+    version="7.6.0"
 )
 
 app.add_middleware(
@@ -337,6 +338,264 @@ def parsear_acuse_sat_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
     return resultado
 
 # ---------------------------------------------------------------------------
+# Motor de Conciliación Fiscal DyP (CFDI PUE + CRP vs Devengado ISR)
+# ---------------------------------------------------------------------------
+
+def a_float(valor: Any) -> float:
+    try:
+        return float(valor) if valor is not None else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+def parse_fecha_corta(fecha_str: str) -> Optional[datetime]:
+    if not fecha_str:
+        return None
+    limpia = fecha_str.strip().split("T")[0]
+    try:
+        return datetime.strptime(limpia, "%Y-%m-%d")
+    except Exception:
+        return None
+
+def limpiar_tag_xml(tag: str) -> str:
+    return tag.split("}")[-1] if "}" in tag else tag
+
+def procesar_xml_individual(xml_str: str, rfc_empresa: str) -> Dict[str, Any]:
+    res = {
+        "es_emitido": False,
+        "es_recibido": False,
+        "tipo_comprobante": "",
+        "metodo_pago": "",
+        "fecha": None,
+        "subtotal": 0.0,
+        "anticipos": 0.0,
+        "iva_16": 0.0,
+        "iva_8": 0.0,
+        "ret_isr_sueldos": 0.0,
+        "ret_isr_servicios": 0.0,
+        "ret_isr_arrendamiento": 0.0,
+        "ret_isr_fletes": 0.0,
+        "ret_isr_resico": 0.0,
+        "ret_iva": 0.0,
+        "ieps": 0.0,
+        "crp_pagos": []
+    }
+
+    try:
+        root = ET.fromstring(xml_str.encode("utf-8") if isinstance(xml_str, str) else xml_str)
+    except Exception:
+        return res
+
+    tipo = root.attrib.get("TipoDeComprobante", "I").upper()
+    metodo = root.attrib.get("MetodoPago", "").upper()
+    fecha = parse_fecha_corta(root.attrib.get("Fecha", ""))
+    subtotal = a_float(root.attrib.get("SubTotal", 0.0))
+
+    emisor_elem = next((e for e in root if limpiar_tag_xml(e.tag) == "Emisor"), None)
+    receptor_elem = next((e for e in root if limpiar_tag_xml(e.tag) == "Receptor"), None)
+
+    rfc_emisor = (emisor_elem.attrib.get("Rfc", "") if emisor_elem is not None else "").upper().strip()
+    rfc_receptor = (receptor_elem.attrib.get("Rfc", "") if receptor_elem is not None else "").upper().strip()
+    rfc_emp = rfc_empresa.upper().strip()
+
+    es_emitido = (rfc_emisor == rfc_emp)
+    es_recibido = (rfc_receptor == rfc_emp)
+
+    res.update({
+        "es_emitido": es_emitido,
+        "es_recibido": es_recibido,
+        "tipo_comprobante": tipo,
+        "metodo_pago": metodo,
+        "fecha": fecha,
+        "subtotal": subtotal
+    })
+
+    if tipo == "N":
+        for elem in root.iter():
+            if limpiar_tag_xml(elem.tag) == "Deduccion":
+                if elem.attrib.get("TipoDeduccion", "") == "002":
+                    res["ret_isr_sueldos"] += a_float(elem.attrib.get("Importe", 0.0))
+        return res
+
+    if tipo in ("I", "E"):
+        for elem in root.iter():
+            t = limpiar_tag_xml(elem.tag)
+            if t == "Concepto":
+                if elem.attrib.get("ClaveProdServ", "") == "84111506":
+                    res["anticipos"] += a_float(elem.attrib.get("Importe", 0.0))
+            elif t == "Traslado":
+                imp = elem.attrib.get("Impuesto", "")
+                tasa = a_float(elem.attrib.get("TasaOCuota", 0.0))
+                monto = a_float(elem.attrib.get("Importe", 0.0))
+                if imp == "002":
+                    if 0.15 <= tasa <= 0.17:
+                        res["iva_16"] += monto
+                    elif 0.07 <= tasa <= 0.09:
+                        res["iva_8"] += monto
+                elif imp == "003":
+                    res["ieps"] += monto
+            elif t == "Retencion":
+                imp = elem.attrib.get("Impuesto", "")
+                monto = a_float(elem.attrib.get("Importe", 0.0))
+                tasa = a_float(elem.attrib.get("TasaOCuota", 0.0))
+                if imp == "002":
+                    res["ret_iva"] += monto
+                elif imp == "001":
+                    if 0.099 <= tasa <= 0.1067:
+                        res["ret_isr_servicios"] += monto
+                    elif 0.012 <= tasa <= 0.013:
+                        res["ret_isr_resico"] += monto
+                    else:
+                        res["ret_isr_arrendamiento"] += monto
+
+    elif tipo == "P":
+        for elem in root.iter():
+            if limpiar_tag_xml(elem.tag) == "Pago":
+                f_pago = parse_fecha_corta(elem.attrib.get("FechaPago", ""))
+                monto_pago = a_float(elem.attrib.get("Monto", 0.0))
+                iva_pago, ret_isr_pago, ret_iva_pago = 0.0, 0.0, 0.0
+
+                for sub in elem.iter():
+                    st = limpiar_tag_xml(sub.tag)
+                    if st in ("TrasladoP", "TrasladoDR"):
+                        if sub.attrib.get("ImpuestoP", sub.attrib.get("Impuesto", "")) == "002":
+                            iva_pago += a_float(sub.attrib.get("ImporteP", sub.attrib.get("Importe", 0.0)))
+                    elif st in ("RetencionP", "RetencionDR"):
+                        imp = sub.attrib.get("ImpuestoP", sub.attrib.get("Impuesto", ""))
+                        m = a_float(sub.attrib.get("ImporteP", sub.attrib.get("Importe", 0.0)))
+                        if imp == "001":
+                            ret_isr_pago += m
+                        elif imp == "002":
+                            ret_iva_pago += m
+
+                res["crp_pagos"].append({
+                    "fecha_pago": f_pago,
+                    "monto_total": monto_pago,
+                    "iva_16": iva_pago,
+                    "ret_isr": ret_isr_pago,
+                    "ret_iva": ret_iva_pago
+                })
+
+    return res
+
+def conciliar_periodo_fiscal(
+    datos_declaracion: Dict[str, Any],
+    lista_xmls_comprobantes: List[str]
+) -> Dict[str, Any]:
+    metadatos = datos_declaracion.get("metadatos", {})
+    rfc_empresa = metadatos.get("rfc", "").strip().upper()
+    ejercicio = metadatos.get("ejercicio")
+    
+    meses_map = {
+        "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+        "julio": 7, "agosto": 8, "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12
+    }
+    periodo_str = metadatos.get("periodo", "").lower().strip()
+    mes_num = meses_map.get(periodo_str, datetime.now().month)
+
+    cfdi_det = {
+        "isr_ingresos_nominales": 0.0,
+        "isr_anticipos": 0.0,
+        "iva_trasladado_pue": 0.0,
+        "iva_trasladado_crp": 0.0,
+        "iva_acreditable_pue": 0.0,
+        "iva_acreditable_crp": 0.0,
+        "ret_iva_efectuada_a_terceros": 0.0,
+        "ret_isr_sueldos": 0.0,
+        "ret_isr_servicios": 0.0,
+        "ret_isr_arrendamiento": 0.0,
+        "ret_isr_resico": 0.0,
+        "ieps_trasladado": 0.0,
+        "ieps_acreditable": 0.0
+    }
+
+    for xml_raw in lista_xmls_comprobantes:
+        info = procesar_xml_individual(xml_raw, rfc_empresa)
+        f = info["fecha"]
+
+        # 1. Ingresos ISR Devengados
+        if info["es_emitido"] and info["tipo_comprobante"] == "I":
+            if f and f.year == ejercicio and f.month == mes_num:
+                cfdi_det["isr_ingresos_nominales"] += info["subtotal"]
+                cfdi_det["isr_anticipos"] += info["anticipos"]
+
+        # 2. Flujo de Efectivo PUE
+        if f and f.year == ejercicio and f.month == mes_num and info["metodo_pago"] == "PUE":
+            if info["es_emitido"]:
+                cfdi_det["iva_trasladado_pue"] += (info["iva_16"] + info["iva_8"])
+                cfdi_det["ieps_trasladado"] += info["ieps"]
+            elif info["es_recibido"]:
+                cfdi_det["iva_acreditable_pue"] += (info["iva_16"] + info["iva_8"])
+                cfdi_det["ieps_acreditable"] += info["ieps"]
+                cfdi_det["ret_iva_efectuada_a_terceros"] += info["ret_iva"]
+                cfdi_det["ret_isr_servicios"] += info["ret_isr_servicios"]
+                cfdi_det["ret_isr_arrendamiento"] += info["ret_isr_arrendamiento"]
+                cfdi_det["ret_isr_resico"] += info["ret_isr_resico"]
+
+        # 3. Nómina Salarios
+        if info["es_emitido"] and info["tipo_comprobante"] == "N":
+            if f and f.year == ejercicio and f.month == mes_num:
+                cfdi_det["ret_isr_sueldos"] += info["ret_isr_sueldos"]
+
+        # 4. Flujo de Efectivo CRP (Complementos de Pago)
+        if info["tipo_comprobante"] == "P":
+            for p in info["crp_pagos"]:
+                fp = p["fecha_pago"]
+                if fp and fp.year == ejercicio and fp.month == mes_num:
+                    if info["es_emitido"]:
+                        cfdi_det["iva_trasladado_crp"] += p["iva_16"]
+                    elif info["es_recibido"]:
+                        cfdi_det["iva_acreditable_crp"] += p["iva_16"]
+                        cfdi_det["ret_iva_efectuada_a_terceros"] += p["ret_iva"]
+
+    tot_iva_trasladado_cfdi = cfdi_det["iva_trasladado_pue"] + cfdi_det["iva_trasladado_crp"]
+    tot_iva_acreditable_cfdi = cfdi_det["iva_acreditable_pue"] + cfdi_det["iva_acreditable_crp"]
+    tot_ingresos_isr_cfdi = cfdi_det["isr_ingresos_nominales"] + cfdi_det["isr_anticipos"]
+    tot_ret_terceros_isr_cfdi = (
+        cfdi_det["ret_isr_servicios"] +
+        cfdi_det["ret_isr_arrendamiento"] +
+        cfdi_det["ret_isr_resico"]
+    )
+
+    dec_iva = datos_declaracion.get("iva", {})
+    dec_isr = datos_declaracion.get("isr", {})
+    dec_ret = datos_declaracion.get("retenciones", {})
+
+    dec_iva_tras = dec_iva.get("iva_trasladado_cobrado", 0.0)
+    dec_iva_acred = dec_iva.get("iva_acreditable_pagado", 0.0)
+    dec_isr_ing = dec_isr.get("ingresos_nominales", 0.0)
+    dec_ret_sueldos = dec_ret.get("sueldos_y_salarios", 0.0)
+    dec_ret_terceros = (
+        dec_ret.get("servicios_profesionales", 0.0) +
+        dec_ret.get("arrendamiento", 0.0) +
+        dec_ret.get("resico_pf", 0.0)
+    )
+    dec_ret_iva = dec_ret.get("retenciones_iva", 0.0)
+
+    def evaluar(declarado: float, cfdi: float, tipo: str) -> Dict[str, Any]:
+        dif = round(declarado - cfdi, 2)
+        if abs(dif) <= 5.0:
+            return {"declarado": declarado, "cfdi": round(cfdi, 2), "diferencia": 0.0, "estatus": "CORRECTO", "color": "verde"}
+        if tipo in ("ingreso", "retencion") and dif < -5.0:
+            return {"declarado": declarado, "cfdi": round(cfdi, 2), "diferencia": dif, "estatus": "RIESGO_ALTO", "color": "rojo"}
+        if tipo == "acreditable" and dif > 5.0:
+            return {"declarado": declarado, "cfdi": round(cfdi, 2), "diferencia": dif, "estatus": "RIESGO_ALTO", "color": "rojo"}
+        return {"declarado": declarado, "cfdi": round(cfdi, 2), "diferencia": dif, "estatus": "OBSERVACION", "color": "amarillo"}
+
+    return {
+        "periodo": f"{periodo_str.capitalize()} {ejercicio}",
+        "rfc": rfc_empresa,
+        "resumen_conciliacion": {
+            "iva_trasladado": evaluar(dec_iva_tras, tot_iva_trasladado_cfdi, "ingreso"),
+            "iva_acreditable": evaluar(dec_iva_acred, tot_iva_acreditable_cfdi, "acreditable"),
+            "isr_ingresos_nominales": evaluar(dec_isr_ing, tot_ingresos_isr_cfdi, "ingreso"),
+            "retenciones_sueldos_salarios": evaluar(dec_ret_sueldos, cfdi_det["ret_isr_sueldos"], "retencion"),
+            "retenciones_terceros_isr": evaluar(dec_ret_terceros, tot_ret_terceros_isr_cfdi, "retencion"),
+            "retenciones_iva_a_terceros": evaluar(dec_ret_iva, cfdi_det["ret_iva_efectuada_a_terceros"], "retencion")
+        },
+        "desglose_cfdi_determinado": cfdi_det
+    }
+
+# ---------------------------------------------------------------------------
 # Workers en Segundo Plano: CSF y Opinión 32-D (satcfdi)
 # ---------------------------------------------------------------------------
 
@@ -436,13 +695,13 @@ async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: byt
 def ruta_raiz():
     return {
         "status": "ok",
-        "servicio": "SAT Descarga Masiva, CSF, Opinión 32-D y Conciliación API",
-        "version": "7.5.0"
+        "servicio": "SAT Descarga Masiva, CSF, Opinión 32-D y Conciliación DyP API",
+        "version": "7.6.0"
     }
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "version": "7.5.0"}
+    return {"status": "healthy", "version": "7.6.0"}
 
 @app.get("/api/sat/task-status/{task_id}")
 def obtener_estado_tarea(task_id: str):
@@ -451,7 +710,7 @@ def obtener_estado_tarea(task_id: str):
     return TASKS[task_id]
 
 # ---------------------------------------------------------------------------
-# Endpoints de CSF, Opinión 32-D y Parseo de Declaración
+# Endpoints de Parseo de Declaración y Conciliación Fiscal (Lovable)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/sat/parse-declaracion")
@@ -477,6 +736,53 @@ async def parse_declaracion_endpoint(archivo_acuse: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Error parseando acuse SAT: {e}")
         raise HTTPException(status_code=500, detail=f"No se pudo interpretar el acuse del SAT: {str(e)}")
+
+@app.post("/api/sat/conciliar-declaracion")
+async def conciliar_declaracion_endpoint(
+    archivo_acuse: UploadFile = File(...),
+    comprobantes_zip: Optional[UploadFile] = File(None)
+):
+    """
+    Recibe el acuse de la declaración en PDF y opcionalmente el ZIP con los XMLs del mes.
+    Ejecuta el cruce auditado respetando Flujo de Efectivo (PUE + CRPs) y Devengado (ISR).
+    """
+    if not archivo_acuse.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="El acuse debe ser un archivo PDF.")
+
+    contenido_pdf = await archivo_acuse.read()
+    datos_declaracion = parsear_acuse_sat_bytes(contenido_pdf)
+
+    xmls: List[str] = []
+    if comprobantes_zip:
+        zip_bytes = await comprobantes_zip.read()
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+                for n in z.namelist():
+                    if n.lower().endswith(".xml"):
+                        xmls.append(z.read(n).decode("utf-8", errors="ignore"))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error al descomprimir archivo ZIP: {str(e)}")
+
+    if not xmls:
+        return {
+            "status": "success",
+            "modo": "solo_declaracion",
+            "declaracion": datos_declaracion,
+            "mensaje": "Declaración parseada con éxito. Envíe el archivo ZIP de comprobantes XML para realizar el cruce."
+        }
+
+    resultado_cruce = conciliar_periodo_fiscal(datos_declaracion, xmls)
+
+    return {
+        "status": "success",
+        "modo": "conciliacion_completa",
+        "declaracion": datos_declaracion,
+        "auditoria": resultado_cruce
+    }
+
+# ---------------------------------------------------------------------------
+# Endpoints de CSF y Opinión 32-D
+# ---------------------------------------------------------------------------
 
 @app.post("/api/sat/sync-csf")
 async def iniciar_sync_csf(
