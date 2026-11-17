@@ -5,3 +5,4 @@ cryptography
 pypdf
 cfdiclient
 satcfdi
+playwright
