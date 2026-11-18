@@ -602,7 +602,35 @@ def conciliar_periodo_fiscal(
 def _generar_csf_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
     signer = Signer.load(certificate=cer_bytes, key=key_bytes, password=password)
     sp = SATPortalConstancia(signer)
-    return sp.generar_constancia()
+    respuesta = sp.generar_constancia()
+
+    # Validar antes de entregar la respuesta al lector de PDF.
+    # Nunca registrar el contenido recibido: puede contener datos fiscales.
+    if not isinstance(respuesta, (bytes, bytearray)) or not respuesta:
+        logger.warning("CSF: el SAT no entregó un documento binario válido.")
+        raise ValueError(
+            "El SAT no entregó un documento válido. No se obtuvo la CSF; "
+            "intenta nuevamente más tarde."
+        )
+
+    pdf_bytes = bytes(respuesta)
+    inicio = pdf_bytes[:1024].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if not inicio.startswith(b"%PDF-"):
+        inicio_minusculas = inicio.lower()
+        if inicio_minusculas.startswith(b"<?xml"):
+            formato = "XML"
+        elif inicio_minusculas.startswith((b"<!doctype html", b"<html")):
+            formato = "HTML"
+        else:
+            formato = "no reconocido"
+        logger.warning("CSF: respuesta del SAT en formato %s, no PDF.", formato)
+        raise ValueError(
+            f"El SAT devolvió una respuesta en formato {formato}, no la CSF en PDF. "
+            "No se guardó como constancia. Esto no confirma un rechazo de la e.firma; "
+            "intenta nuevamente más tarde."
+        )
+
+    return pdf_bytes
 
 async def tarea_descargar_csf(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "csf", "created_at": datetime.now().isoformat()}
@@ -643,15 +671,45 @@ def _generar_opinion_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> 
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
             })
-            pdf_bytes = op.generar_opinion_cumplimiento()
-            if pdf_bytes and len(pdf_bytes) > 500:
-                return pdf_bytes
+            respuesta = op.generar_opinion_cumplimiento()
         except Exception as e:
             ultimo_error = e
             logger.warning(f"Intento {intento} falló para Opinión 32-D: {e}")
-            time.sleep(5)
+            if intento < 3:
+                time.sleep(5)
+            continue
 
-    raise ultimo_error
+        # Validar antes de entregar la respuesta al lector de PDF.
+        # Nunca registrar el contenido recibido: puede contener datos fiscales.
+        if not isinstance(respuesta, (bytes, bytearray)) or not respuesta:
+            logger.warning("Opinión 32-D: el SAT no entregó un documento binario válido.")
+            raise ValueError(
+                "El SAT no entregó un documento válido. No se obtuvo la Opinión 32-D; "
+                "intenta nuevamente más tarde."
+            )
+
+        pdf_bytes = bytes(respuesta)
+        inicio = pdf_bytes[:1024].lstrip(b"\xef\xbb\xbf \t\r\n")
+        if not inicio.startswith(b"%PDF-"):
+            inicio_minusculas = inicio.lower()
+            if inicio_minusculas.startswith(b"<?xml"):
+                formato = "XML"
+            elif inicio_minusculas.startswith((b"<!doctype html", b"<html")):
+                formato = "HTML"
+            else:
+                formato = "no reconocido"
+            logger.warning("Opinión 32-D: respuesta del SAT en formato %s, no PDF.", formato)
+            raise ValueError(
+                f"El SAT devolvió una respuesta en formato {formato}, no la Opinión 32-D en PDF. "
+                "No se guardó como opinión. Esto no confirma un rechazo de la e.firma; "
+                "intenta nuevamente más tarde."
+            )
+
+        return pdf_bytes
+
+    if ultimo_error is not None:
+        raise ultimo_error
+    raise ValueError("No se obtuvo la Opinión 32-D del SAT.")
 
 async def tarea_descargar_opinion(task_id: str, cer_bytes: bytes, key_bytes: bytes, password: str, rfc: str):
     TASKS[task_id] = {"status": "processing", "tipo": "opinion", "created_at": datetime.now().isoformat()}
