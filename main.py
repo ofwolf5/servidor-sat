@@ -599,6 +599,34 @@ def conciliar_periodo_fiscal(
 # Workers en Segundo Plano: CSF y Opinión 32-D (satcfdi)
 # ---------------------------------------------------------------------------
 
+def _diagnostico_xml_sat(contenido: bytes) -> str:
+    """Resumen seguro de un aviso XML del SAT: etiqueta principal y texto del
+    mensaje de error, con RFC, CURP, correos y números largos ocultos."""
+    try:
+        import xml.etree.ElementTree as ET
+        texto = contenido.decode("utf-8", errors="replace")
+        raiz = ET.fromstring(texto.strip().lstrip("\ufeff"))
+        def local(tag):
+            return tag.split("}", 1)[-1] if isinstance(tag, str) else ""
+        etiquetas = []
+        mensajes = []
+        claves = ("fault", "error", "mensaje", "message", "descripcion", "description", "codigo", "code", "estatus", "status", "detail")
+        for el in raiz.iter():
+            nombre = local(el.tag)
+            if nombre and nombre not in etiquetas and len(etiquetas) < 8:
+                etiquetas.append(nombre)
+            valor = (el.text or "").strip()
+            if valor and any(c in nombre.lower() for c in claves):
+                mensajes.append(f"{nombre}: {valor}")
+        resumen = "; ".join(mensajes)[:300]
+        resumen = re.sub(r"[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}", "[RFC]", resumen, flags=re.IGNORECASE)
+        resumen = re.sub(r"[A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d", "[CURP]", resumen, flags=re.IGNORECASE)
+        resumen = re.sub(r"[\w.+-]+@[\w-]+\.[\w.]+", "[correo]", resumen)
+        resumen = re.sub(r"\d{6,}", "[número]", resumen)
+        return f"etiqueta={local(raiz.tag)}; elementos={','.join(etiquetas)}; aviso={resumen or 'sin texto de error'}"
+    except Exception as exc:
+        return f"XML no legible ({type(exc).__name__}), {len(contenido)} bytes"
+
 def _generar_csf_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> bytes:
     signer = Signer.load(certificate=cer_bytes, key=key_bytes, password=password)
     sp = SATPortalConstancia(signer)
@@ -623,11 +651,13 @@ def _generar_csf_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> byte
             formato = "HTML"
         else:
             formato = "no reconocido"
-        logger.warning("CSF: respuesta del SAT en formato %s, no PDF.", formato)
+        diagnostico = _diagnostico_xml_sat(pdf_bytes) if formato == "XML" else ""
+        logger.warning("CSF: respuesta del SAT en formato %s, no PDF. %s", formato, diagnostico)
         raise ValueError(
             f"El SAT devolvió una respuesta en formato {formato}, no la CSF en PDF. "
             "No se guardó como constancia. Esto no confirma un rechazo de la e.firma; "
             "intenta nuevamente más tarde."
+            + (f" Detalle del SAT: {diagnostico}" if diagnostico else "")
         )
 
     return pdf_bytes
@@ -698,11 +728,13 @@ def _generar_opinion_sync(cer_bytes: bytes, key_bytes: bytes, password: str) -> 
                 formato = "HTML"
             else:
                 formato = "no reconocido"
-            logger.warning("Opinión 32-D: respuesta del SAT en formato %s, no PDF.", formato)
+            diagnostico = _diagnostico_xml_sat(pdf_bytes) if formato == "XML" else ""
+            logger.warning("Opinión 32-D: respuesta del SAT en formato %s, no PDF. %s", formato, diagnostico)
             raise ValueError(
                 f"El SAT devolvió una respuesta en formato {formato}, no la Opinión 32-D en PDF. "
                 "No se guardó como opinión. Esto no confirma un rechazo de la e.firma; "
                 "intenta nuevamente más tarde."
+                + (f" Detalle del SAT: {diagnostico}" if diagnostico else "")
             )
 
         return pdf_bytes
